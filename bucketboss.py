@@ -9,6 +9,7 @@ import subprocess
 import botocore
 import boto3
 import sys
+import threading # Import threading
 from abc import ABC, abstractmethod # For Abstract Base Class
 
 from prompt_toolkit import PromptSession
@@ -170,29 +171,55 @@ class S3Provider(CloudProvider):
         """Get S3 bucket location and creation date."""
         stats = {}
         try:
-            # Get bucket location
-            location_response = self.s3_client.get_bucket_location(Bucket=self.bucket_name)
-            # LocationConstraint can be None for us-east-1, map it
-            stats['Location'] = location_response.get('LocationConstraint') or 'us-east-1' 
-        except ClientError as e:
-            stats['Location'] = f"Error: {e.response.get('Error', {}).get('Code', 'Unknown')}"
-        
-        try:
-            # Get creation date (requires list_buckets permission potentially)
-            # A more reliable way might be head_bucket if available & contains date?
-            # head_bucket doesn't reliably return creation date. list_buckets is needed.
-            list_response = self.s3_client.list_buckets() 
-            for bucket in list_response.get('Buckets', []):
-                 if bucket['Name'] == self.bucket_name:
-                     stats['CreationDate'] = bucket['CreationDate'].isoformat()
-                     break
-            if 'CreationDate' not in stats:
-                 stats['CreationDate'] = "Not found (requires list_buckets permission)"
-        except ClientError as e:
-             stats['CreationDate'] = f"Error: {e.response.get('Error', {}).get('Code', 'Unknown')}"
+            # --- Get Location --- 
+            try:
+                location_response = self.s3_client.get_bucket_location(Bucket=self.bucket_name)
+                # Handle potential None response defensively, though unlikely for this call
+                if location_response:
+                    stats['Location'] = location_response.get('LocationConstraint') or 'us-east-1'
+                else:
+                    stats['Location'] = "Error: Received no response for location."
+            except ClientError as e_loc:
+                stats['Location'] = f"Error: {e_loc.response.get('Error', {}).get('Code', 'Unknown')}"
+            except Exception as e_loc_other: # Catch unexpected errors here
+                 stats['Location'] = f"Unexpected error getting location: {str(e_loc_other)}"
+
+            # --- Get Creation Date --- 
+            try:
+                list_response = self.s3_client.list_buckets()
+                found_date = False
+                # Check if response and 'Buckets' key exist
+                if list_response and 'Buckets' in list_response:
+                    for bucket in list_response.get('Buckets') or []: # Ensure iteration over list
+                         # Check if bucket dict has Name and CreationDate
+                         if bucket and bucket.get('Name') == self.bucket_name and bucket.get('CreationDate'):
+                             stats['CreationDate'] = bucket['CreationDate'].isoformat()
+                             found_date = True
+                             break
+                if not found_date:
+                     # Only set this if we didn't successfully find it
+                     if 'CreationDate' not in stats:
+                          stats['CreationDate'] = "Not found (or requires list_buckets permission)"
+            except ClientError as e_date:
+                 # If we already have a date, don't overwrite with an error unless necessary
+                 if 'CreationDate' not in stats:
+                      stats['CreationDate'] = f"Error: {e_date.response.get('Error', {}).get('Code', 'Unknown')}"
+            except Exception as e_date_other: # Catch unexpected errors here
+                 if 'CreationDate' not in stats:
+                      # Use a generic message instead of trying str(e_date_other)
+                      stats['CreationDate'] = f"Unexpected error processing creation date data."
+
+            # --- Size Placeholder --- 
+            stats['Size'] = "N/A (Requires separate calculation)"
+            
+        except Exception as outer_e: 
+             # Catch-all for any error during the overall process if needed, though inner catches are better
+             print(f"General error during get_bucket_stats: {str(outer_e)}", file=sys.stderr)
+             # Ensure basic stats structure exists even on outer error
+             if 'Location' not in stats: stats['Location'] = "Error retrieving"
+             if 'CreationDate' not in stats: stats['CreationDate'] = "Error retrieving"
+             if 'Size' not in stats: stats['Size'] = "N/A"
              
-        # S3 Bucket size requires iterating over all objects or using S3 Inventory/Metrics (complex)
-        stats['Size'] = "N/A (Requires separate calculation)"
         return stats
 
 # --- BucketBoss Completer --- (Formerly S3Completer)
@@ -367,7 +394,13 @@ class BucketBossApp:
             'put': self.do_put,
             'clear': self.do_clear,
             'help': self.do_help,
+            'stats': self.do_stats,
+            'crawlstatus': self.do_crawl_status, # Add crawl status command
         }
+        # Initialize placeholder for background stats collection
+        self.stats_result = {"status": "pending"}
+        # Initialize placeholder for background cache crawl
+        self.crawl_status = {"status": "pending", "depth": 0, "cached_prefixes": 0} 
 
     def get_prompt(self):
         """Generate the prompt string using the provider."""
@@ -453,8 +486,16 @@ class BucketBossApp:
             # Use cached data if available
             if prefix in self.cache:
                 directories, files = self.cache[prefix]
+                # Re-sort cached files if needed (cache stores unsorted)
+                if sort_key == 'date':
+                    files.sort(key=lambda x: x['last_modified'], reverse=True)
+                elif sort_key == 'size':
+                    files.sort(key=lambda x: x['size'], reverse=True)
+                else: # Default name sort
+                    files.sort(key=lambda x: x['name'])
+                # Directories are assumed to be stored sorted in cache
             else:
-                # Use provider to list objects
+                # Use provider to list objects with sorting
                 directories, files = self.provider.list_objects(prefix, sort_key)
                 self.cache[prefix] = (directories, files)
             
@@ -467,27 +508,112 @@ class BucketBossApp:
                  print("No objects found.")
                  return
             
+            # --- Pagination Logic --- 
+            try:
+                 term_height = os.get_terminal_size().lines
+                 # Leave room for prompt, input, and messages
+                 page_limit = max(1, term_height - 3) 
+            except OSError: # Handle environments without a TTY
+                 term_height = float('inf')
+                 page_limit = float('inf')
+            
+            line_count = 0
             for entry, entry_type in all_entries:
                 if entry_type == 'dir':
                     print(self._format_dir_entry(entry))
                 else:
                     print(self._format_file_entry(entry, detailed))
+                line_count += 1
+                
+                # Check if page limit reached
+                if line_count >= page_limit and line_count < len(all_entries):
+                    try:
+                        more_prompt = "--More-- (Enter: next page, q: quit)"
+                        choice = input(more_prompt).strip().lower()
+                        # Erase the prompt line after input
+                        print("\033[F\033[K", end='') 
+                        if choice == 'q':
+                             print("[Listing aborted by user]")
+                             break
+                        line_count = 0 # Reset for next page
+                    except (KeyboardInterrupt, EOFError):
+                         print("\n[Listing aborted by user]")
+                         break # Exit loop on Ctrl+C/Ctrl+D during prompt
+            # --- End Pagination Logic ---
 
         except Exception as e:
              print(f"Error during ls: {e}") # Provider should handle specific errors
 
     def do_cd(self, *args):
-        """Change the current remote prefix."""
+        """Change the current remote prefix after verifying existence."""
         if len(args) != 1:
             print("Usage: cd <path>")
             return
-        path = args[0]
+            
+        path_arg = args[0]
+        original_prefix = self.current_prefix
+        
         try:
-             # Use provider to resolve the new path
-             new_prefix = self.provider.resolve_path(self.current_prefix, path, is_directory=True)
-             # We might want the provider to validate the prefix exists if possible
-             # For S3, checking existence of a prefix is implicit in listing
-             self.current_prefix = new_prefix
+            # 1. Resolve the potential new path string
+            potential_new_prefix = self.provider.resolve_path(original_prefix, path_arg, is_directory=True)
+            
+            # Prevent cd-ing into the same directory silently
+            if potential_new_prefix == original_prefix and path_arg not in ('/', '', '.'):
+                 # Allow cd . or cd / even if they resolve to the same place
+                 # But block `cd existing_dir` if already in parent
+                 print(f"Already in '{potential_new_prefix}'") # Or just return silently
+                 # return
+                 pass # Allow explicit cd into current dir for now, maybe change later
+            elif potential_new_prefix == original_prefix and path_arg in ('/', '', '.'):
+                 # Explicitly cd to root or current - always allow, don't validate further
+                 self.current_prefix = potential_new_prefix
+                 return
+                 
+            # 2. Validate the target directory exists
+            target_dir_name = path_arg.split('/')[-1] or path_arg.split('/')[-2] # Get last non-empty part
+            if not target_dir_name or target_dir_name == '.': # Handle cases like 'cd .' or 'cd dir/.'
+                 target_dir_name = potential_new_prefix.rstrip('/').split('/')[-1]
+                 
+            # If target is '..', resolve first then check parent of resolved
+            parent_to_check = original_prefix
+            if target_dir_name == '..':
+                # Already resolved by provider.resolve_path, just check existence of potential_new_prefix
+                # We can list potential_new_prefix itself and see if it works
+                 try:
+                      print(f"[Validating prefix: {potential_new_prefix}]", file=sys.stderr)
+                      self.provider.list_objects(potential_new_prefix) # Check if listing works
+                      # If list_objects succeeds (doesn't raise), assume it's valid
+                      self.current_prefix = potential_new_prefix
+                      print(f"Changed directory to: {self.current_prefix or '/'}")
+                      return
+                 except Exception as e_check:
+                      print(f"Error: Cannot cd to '{potential_new_prefix}': {e_check}")
+                      return
+            elif potential_new_prefix == '/' or potential_new_prefix == '': # Target is root
+                parent_to_check = '' # Check root contents
+                target_dir_name = path_arg.strip('/') # Check if root was the target
+                if not target_dir_name:
+                     self.current_prefix = '' # Allow cd /
+                     return
+                 # If path_arg was like /nonexistent, target_dir_name will be set
+            else:
+                 # Determine the parent prefix of the *potential* new prefix
+                 parent_to_check = potential_new_prefix.rsplit('/', 2)[0] + '/' if '/' in potential_new_prefix.rstrip('/') else ''
+                 # Target name is the last part of the potential new prefix
+                 target_dir_name = potential_new_prefix.rstrip('/').split('/')[-1]
+                 
+            # List the parent directory to find the target
+            print(f"[Checking parent: '{parent_to_check or '<root>'}' for '{target_dir_name}']", file=sys.stderr)
+            parent_dirs, _ = self.provider.list_objects(parent_to_check)
+            
+            # 3. Check if the target directory name is in the list from the parent
+            if target_dir_name in parent_dirs:
+                self.current_prefix = potential_new_prefix
+                # Optionally print confirmation
+                # print(f"Changed directory to: {self.current_prefix or '/'}")
+            else:
+                print(f"Error: Directory not found: {path_arg}")
+
         except Exception as e:
              print(f"Error changing directory: {e}")
 
@@ -505,7 +631,36 @@ class BucketBossApp:
         try:
             # Use provider to get object content
             content_bytes = self.provider.get_object(object_key)
-            print(content_bytes.decode('utf-8'))
+            content = content_bytes.decode('utf-8')
+            
+            # --- Pagination Logic for Cat --- 
+            lines = content.splitlines()
+            try:
+                 term_height = os.get_terminal_size().lines
+                 page_limit = max(1, term_height - 2) # Leave room for prompt
+            except OSError:
+                 term_height = float('inf')
+                 page_limit = float('inf')
+                 
+            line_count = 0
+            for i, line in enumerate(lines):
+                 print(line)
+                 line_count += 1
+                 
+                 if line_count >= page_limit and i < len(lines) - 1:
+                      try:
+                           more_prompt = "--More-- (Enter: next page, q: quit)"
+                           choice = input(more_prompt).strip().lower()
+                           print("\033[F\033[K", end='') # Erase prompt
+                           if choice == 'q':
+                                print("[Output aborted by user]")
+                                break
+                           line_count = 0 # Reset for next page
+                      except (KeyboardInterrupt, EOFError):
+                           print("\n[Output aborted by user]")
+                           break
+            # --- End Pagination Logic --- 
+            
         except ClientError as e:
             # Catch S3 specific error for example, but should be general
             error_code = e.response.get('Error', {}).get('Code', 'Unknown')
@@ -606,6 +761,39 @@ class BucketBossApp:
         for cmd in sorted(self.commands.keys()):
             print(f"  {cmd}")
         print("\nUse TAB for completion.")
+        
+    def do_stats(self, *args):
+        """Display collected bucket statistics."""
+        status = self.stats_result.get("status", "unknown")
+        
+        if status == "pending" or status == "loading":
+            print("Stats collection initiated in background, not yet complete...")
+        elif status == "error":
+            print(f"Error collecting stats: {self.stats_result.get('error_message', 'Unknown error')}")
+        elif status == "complete":
+            print("Bucket Stats (collected in background):")
+            for key, value in self.stats_result.items():
+                if key not in ["status", "error_message"]: # Don't print meta keys
+                    print(f"  {key}: {value}")
+        else:
+            print(f"Stats status unknown: {status}")
+
+    def do_crawl_status(self, *args):
+        """Display the status of the background cache crawl."""
+        status = self.crawl_status.get("status", "unknown")
+        depth = self.crawl_status.get("depth", 0)
+        cached = self.crawl_status.get("cached_prefixes", 0)
+        
+        if status == "pending":
+            print("Background cache crawl has not started yet.")
+        elif status == "loading":
+            print(f"Background cache crawl in progress... (Current Depth: {depth}, Prefixes Cached: {cached})")
+        elif status == "complete":
+            print(f"Background cache crawl complete. (Max Depth: {depth}, Prefixes Cached: {cached})")
+        elif status == "error":
+            print(f"Background cache crawl finished with an error: {self.crawl_status.get('error_message', 'Unknown error')}")
+        else:
+             print(f"Crawl status unknown: {status}")
 
     # --- Formatting and Cache Helpers (Remain mostly internal to App) ---
     def list_objects(self, prefix, sort_key='name'):
@@ -715,6 +903,76 @@ def parse_args():
         parser.error('Only one S3 authentication method (--profile, --access-key) can be used.')
     return args
 
+# --- Background Stats Collection ---
+def collect_stats_background(provider: CloudProvider, result_dict: dict):
+    """Target function for background thread to collect stats."""
+    result_dict["status"] = "loading"
+    try:
+        stats = provider.get_bucket_stats()
+        result_dict.update(stats)
+        result_dict["status"] = "complete"
+    except Exception as e:
+        result_dict["status"] = "error"
+        # Store a user-friendly error message
+        if isinstance(e, ClientError):
+             result_dict["error_message"] = f"API Error: {e.response.get('Error', {}).get('Code', 'Unknown')}"
+        else:
+             result_dict["error_message"] = f"Unexpected error: {str(e)}"
+    # Optional: print notification to stderr when done?
+    # print("[Stats collection thread finished]", file=sys.stderr)
+
+# --- Background Cache Crawl --- 
+def crawl_prefix_recursive(provider: CloudProvider, cache: dict, status_dict: dict, prefix: str, current_depth: int, max_depth: int):
+    """Recursively list and cache directories up to max_depth."""
+    if current_depth > max_depth:
+        return
+
+    # Update status for user feedback
+    status_dict["depth"] = max(status_dict.get("depth", 0), current_depth)
+
+    # Avoid re-fetching if already cached by this crawl or user action
+    if prefix in cache:
+        # Still need to get subdirs for recursion even if cached
+        try:
+            dirs, _ = cache[prefix]
+            print(f"[Crawl: Using cached prefix '{prefix or '<root>'}']", file=sys.stderr)
+        except Exception:
+             # Handle potential cache format issues gracefully
+             dirs = []
+             print(f"[Crawl: Cache error for '{prefix or '<root>'}', skipping deeper crawl]", file=sys.stderr)
+    else:
+        try:
+            print(f"[Crawl: Fetching prefix '{prefix or '<root>'}' at depth {current_depth}]", file=sys.stderr)
+            dirs, files = provider.list_objects(prefix)
+            cache[prefix] = (dirs, files)
+            status_dict["cached_prefixes"] = status_dict.get("cached_prefixes", 0) + 1
+        except Exception as e:
+            print(f"[Crawl: Error listing prefix '{prefix or '<root>'}': {e}]", file=sys.stderr)
+            # Don't recurse further down this path if listing failed
+            return 
+
+    # Recurse into subdirectories
+    for subdir in dirs:
+        if subdir: # Ensure subdir is not empty
+            next_prefix = prefix + subdir + '/'
+            crawl_prefix_recursive(provider, cache, status_dict, next_prefix, current_depth + 1, max_depth)
+
+def background_cache_crawl(provider: CloudProvider, cache: dict, status_dict: dict, max_depth: int):
+    """Target function for background thread to crawl and cache."""
+    status_dict["status"] = "loading"
+    status_dict["depth"] = 0
+    status_dict["cached_prefixes"] = 0
+    try:
+        print(f"[Background crawl started: Max Depth {max_depth}]", file=sys.stderr)
+        # Start crawling from the root prefix ('') at depth 1 (for its children)
+        crawl_prefix_recursive(provider, cache, status_dict, '', 1, max_depth)
+        status_dict["status"] = "complete"
+        print(f"[Background crawl finished. Max Depth: {status_dict['depth']}, Prefixes Cached: {status_dict['cached_prefixes']}]", file=sys.stderr)
+    except Exception as e:
+        status_dict["status"] = "error"
+        status_dict["error_message"] = f"Unexpected error during crawl: {str(e)}"
+        print(f"[Background crawl failed: {e}]", file=sys.stderr)
+
 # --- Main Execution --- 
 def main():
     args = parse_args()
@@ -728,16 +986,31 @@ def main():
         provider.head_bucket() 
         print(f"Successfully connected to S3 bucket: {args.bucket}")
         
-        # Get and print stats (Todo item 1)
-        try:
-             print("Fetching bucket stats...")
-             stats = provider.get_bucket_stats()
-             print("Bucket Stats:")
-             for key, value in stats.items():
-                  print(f"  {key}: {value}")
-        except Exception as stat_err:
-             # Explicitly convert the exception to string before printing
-             print(f"Could not retrieve bucket stats: {str(stat_err)}") 
+        # --- Start Stats Collection in Background --- 
+        # Create the app instance first
+        app = BucketBossApp(provider)
+        
+        # Start the background thread, passing the provider and the app's result dict
+        print("Initiating background stats collection...")
+        stats_thread = threading.Thread(
+            target=collect_stats_background, 
+            args=(provider, app.stats_result), 
+            daemon=True # Ensure thread doesn't block exit
+        )
+        stats_thread.start()
+        # --- Stats collection started, do not wait here --- 
+        
+        # --- Start Background Cache Crawl (Depth 2) ---
+        crawl_depth = 2 # Configurable depth
+        if crawl_depth > 0:
+             print(f"Initiating background cache crawl (max depth {crawl_depth})...")
+             crawl_thread = threading.Thread(
+                  target=background_cache_crawl,
+                  args=(provider, app.cache, app.crawl_status, crawl_depth),
+                  daemon=True
+             )
+             crawl_thread.start()
+        # --- Cache crawl started --- 
              
     except ClientError as e:
         error_code = e.response.get('Error', {}).get('Code', 'Unknown')
@@ -757,8 +1030,7 @@ def main():
          print("Error: Could not initialize cloud provider.")
          return
          
-    # Create and run the application
-    app = BucketBossApp(provider)
+    # Run the application (stats thread runs concurrently)
     app.run()
 
 if __name__ == '__main__':
