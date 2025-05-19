@@ -10,7 +10,10 @@ import botocore
 import boto3
 import sys
 import threading # Import threading
+import fnmatch  # For wildcard pattern matching
 from abc import ABC, abstractmethod # For Abstract Base Class
+from itertools import islice
+import time
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
@@ -20,7 +23,9 @@ from prompt_toolkit.styles import Style
 
 from botocore.exceptions import ClientError
 from datetime import datetime
-from itertools import islice
+
+# Cache time-to-live in seconds (default 6 hours)
+CACHE_TTL_SECONDS = 6 * 3600
 
 # --- Cloud Provider Abstraction ---
 class CloudProvider(ABC):
@@ -226,7 +231,7 @@ class S3Provider(CloudProvider):
 class BucketBossCompleter(Completer):
     # Define commands that expect remote paths/dirs/files as arguments
     # These will use provider.resolve_path and provider.list_objects
-    remote_path_commands = {'ls', 'cd', 'cat', 'open'}
+    remote_path_commands = {'ls', 'cd', 'cat', 'open', 'get'}
     # 'put' needs special handling (local first, then remote)
 
     def __init__(self, bucket_boss_app):
@@ -235,14 +240,8 @@ class BucketBossCompleter(Completer):
     def _get_remote_suggestions(self, prefix_to_list, include_files=False):
         """Helper to get remote directory and file suggestions for a given prefix."""
         try:
-            # Use app cache
-            if prefix_to_list in self.app.cache:
-                dirs, files = self.app.cache[prefix_to_list]
-            else:
-                # Fetch suggestions using the provider
-                dirs, files = self.app.provider.list_objects(prefix_to_list)
-                self.app.cache[prefix_to_list] = (dirs, files)
-            
+            # Use centralized app-level list_objects for TTL caching
+            dirs, files = self.app.list_objects(prefix_to_list)
             suggestions = [d + '/' for d in dirs]
             if include_files:
                 suggestions += [f['name'] for f in files]
@@ -396,6 +395,7 @@ class BucketBossApp:
             'help': self.do_help,
             'stats': self.do_stats,
             'crawlstatus': self.do_crawl_status, # Add crawl status command
+            'get': self.do_get,
         }
         # Initialize placeholder for background stats collection
         self.stats_result = {"status": "pending"}
@@ -483,9 +483,11 @@ class BucketBossApp:
         prefix = self.provider.resolve_path(self.current_prefix, path, is_directory=True)
         
         try:
-            # Use cached data if available
-            if prefix in self.cache:
-                directories, files = self.cache[prefix]
+            # Use cached data if available and not expired
+            entry = self.cache.get(prefix)
+            if entry and time.time() - entry[2] < CACHE_TTL_SECONDS:
+                print(f"[Cache hit: {prefix}]", file=sys.stderr)
+                directories, files = entry[0], entry[1]
                 # Re-sort cached files if needed (cache stores unsorted)
                 if sort_key == 'date':
                     files.sort(key=lambda x: x['last_modified'], reverse=True)
@@ -495,9 +497,10 @@ class BucketBossApp:
                     files.sort(key=lambda x: x['name'])
                 # Directories are assumed to be stored sorted in cache
             else:
-                # Use provider to list objects with sorting
+                print(f"[Fetch: {prefix}]", file=sys.stderr)
+                # Fetch fresh data and update cache
                 directories, files = self.provider.list_objects(prefix, sort_key)
-                self.cache[prefix] = (directories, files)
+                self.cache[prefix] = (directories, files, time.time())
             
             all_entries = [
                 *((d, 'dir') for d in directories),
@@ -604,7 +607,7 @@ class BucketBossApp:
                  
             # List the parent directory to find the target
             print(f"[Checking parent: '{parent_to_check or '<root>'}' for '{target_dir_name}']", file=sys.stderr)
-            parent_dirs, _ = self.provider.list_objects(parent_to_check)
+            parent_dirs, _ = self.list_objects(parent_to_check)
             
             # 3. Check if the target directory name is in the list from the parent
             if target_dir_name in parent_dirs:
@@ -799,13 +802,14 @@ class BucketBossApp:
     def list_objects(self, prefix, sort_key='name'):
        # This app-level method now primarily manages the cache
        # It calls the provider's list_objects if needed
-       if prefix in self.cache:
-            return self.cache[prefix]
+       entry = self.cache.get(prefix)
+       if entry and time.time() - entry[2] < CACHE_TTL_SECONDS:
+            return entry[0], entry[1]
        else:
             try:
-                 print(f"[Fetching: {prefix}]", file=sys.stderr)
+                 print(f"[Fetch: {prefix}]", file=sys.stderr)
                  dirs, files = self.provider.list_objects(prefix, sort_key)
-                 self.cache[prefix] = (dirs, files)
+                 self.cache[prefix] = (dirs, files, time.time())
                  return dirs, files
             except Exception as e:
                  # Error already printed by provider, just return empty
@@ -865,6 +869,79 @@ class BucketBossApp:
         if parent_prefix == '' and '' in self.cache:
              print(f"[Cache invalidated for: <root>]", file=sys.stderr)
              del self.cache['']
+
+    def do_get(self, *args):
+        """Download a remote file to local directory where BucketBoss was started."""
+        if len(args) < 1 or len(args) > 2:
+            print("Usage: get <remote_path> [<local_path>]")
+            return
+        remote_path_arg = args[0]
+        local_dest_arg = args[1] if len(args) == 2 else None
+
+        # Wildcard pattern support: download multiple matching files
+        if any(ch in remote_path_arg for ch in ['*', '?']):
+            # Determine directory part and pattern
+            if '/' in remote_path_arg:
+                dir_part, pattern = remote_path_arg.rsplit('/', 1)
+                dir_part += '/'
+            else:
+                dir_part = ''
+                pattern = remote_path_arg
+            prefix = self.provider.resolve_path(self.current_prefix, dir_part, is_directory=True)
+            # List objects under prefix
+            _, files = self.list_objects(prefix)
+            names = [f['name'] for f in files]
+            matches = fnmatch.filter(names, pattern)
+            if not matches:
+                print(f"No matches for pattern: {remote_path_arg}")
+                return
+            for name in matches:
+                key = prefix + name
+                basename = name
+                # Determine destination path
+                if local_dest_arg:
+                    if local_dest_arg.endswith(os.path.sep) or os.path.isdir(local_dest_arg):
+                        dest = os.path.join(local_dest_arg, basename)
+                    else:
+                        dest = local_dest_arg
+                else:
+                    dest = os.path.join(os.getcwd(), basename)
+                try:
+                    print(f"Downloading {key} to {dest}...")
+                    self.provider.download_file(key, dest)
+                    print("Download successful.")
+                except ClientError as e:
+                    error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+                    print(f"Error downloading {key}: {error_code}")
+                except Exception as e:
+                    print(f"Error during get {key}: {e}")
+            return
+
+        # Resolve remote key
+        object_key = self.provider.resolve_path(self.current_prefix, remote_path_arg, is_directory=False)
+        if not object_key or object_key.endswith('/'):
+            print("Error: Invalid file path for get.")
+            return
+
+        basename = os.path.basename(object_key)
+        if local_dest_arg:
+            # If local_dest is a directory or ends with '/', treat as directory
+            if local_dest_arg.endswith(os.path.sep) or os.path.isdir(local_dest_arg):
+                dest_path = os.path.join(local_dest_arg, basename)
+            else:
+                dest_path = local_dest_arg
+        else:
+            dest_path = os.path.join(os.getcwd(), basename)
+
+        try:
+            print(f"Downloading {object_key} to {dest_path}...")
+            self.provider.download_file(object_key, dest_path)
+            print("Download successful.")
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            print(f"Error downloading file: {error_code}")
+        except Exception as e:
+            print(f"Error during get: {e}")
 
 # --- Argument Parsing and Client Creation --- 
 def create_s3_client(args):
@@ -930,26 +1007,21 @@ def crawl_prefix_recursive(provider: CloudProvider, cache: dict, status_dict: di
     # Update status for user feedback
     status_dict["depth"] = max(status_dict.get("depth", 0), current_depth)
 
-    # Avoid re-fetching if already cached by this crawl or user action
-    if prefix in cache:
-        # Still need to get subdirs for recursion even if cached
-        try:
-            dirs, _ = cache[prefix]
-            print(f"[Crawl: Using cached prefix '{prefix or '<root>'}']", file=sys.stderr)
-        except Exception:
-             # Handle potential cache format issues gracefully
-             dirs = []
-             print(f"[Crawl: Cache error for '{prefix or '<root>'}', skipping deeper crawl]", file=sys.stderr)
+    # Cache-aware fetch: avoid re-fetching if TTL not expired
+    entry = cache.get(prefix)
+    if entry and time.time() - entry[2] < CACHE_TTL_SECONDS:
+        dirs = entry[0]
+        print(f"[Crawl: Using cached prefix '{prefix or '<root>'}' at depth {current_depth}]", file=sys.stderr)
     else:
         try:
             print(f"[Crawl: Fetching prefix '{prefix or '<root>'}' at depth {current_depth}]", file=sys.stderr)
             dirs, files = provider.list_objects(prefix)
-            cache[prefix] = (dirs, files)
+            cache[prefix] = (dirs, files, time.time())
             status_dict["cached_prefixes"] = status_dict.get("cached_prefixes", 0) + 1
         except Exception as e:
             print(f"[Crawl: Error listing prefix '{prefix or '<root>'}': {e}]", file=sys.stderr)
             # Don't recurse further down this path if listing failed
-            return 
+            return
 
     # Recurse into subdirectories
     for subdir in dirs:
