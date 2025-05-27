@@ -20,6 +20,7 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.shortcuts import CompleteStyle
 from prompt_toolkit.styles import Style
+from prompt_toolkit.patch_stdout import patch_stdout
 
 from botocore.exceptions import ClientError
 from datetime import datetime
@@ -417,7 +418,9 @@ class BucketBossApp:
         print("BucketBoss Shell. Type 'help' or 'exit'.") # Rebranded intro
         while True:
             try:
-                text = self.session.prompt(self.get_prompt())
+                # Ensure background prints don't break the prompt
+                with patch_stdout():
+                    text = self.session.prompt(self.get_prompt())
                 if not text.strip():
                     continue
                 if not self.handle_command(text):
@@ -479,6 +482,26 @@ class BucketBossApp:
             return
 
         path = ' '.join(arg_list) if arg_list else ''
+        # If a file (not ending with slash) is specified, check and show file info
+        if path and not path.endswith('/'):
+            # Resolve file key without directory slash
+            file_key = self.provider.resolve_path(self.current_prefix, path, is_directory=False)
+            # Determine its parent prefix
+            if '/' in file_key:
+                parent_prefix = file_key.rsplit('/', 1)[0] + '/'
+            else:
+                parent_prefix = ''
+            # List parent to get file metadata
+            _, files = self.list_objects(parent_prefix)
+            for f in files:
+                if f['name'] == os.path.basename(file_key):
+                    # Found the file, display entry and return
+                    print(self._format_file_entry(f, detailed))
+                    return
+            # If not found, it's not a file—error out
+            print(f"Error: '{path}' is not a directory or file not found.")
+            return
+
         # Use provider to resolve path
         prefix = self.provider.resolve_path(self.current_prefix, path, is_directory=True)
         
@@ -486,6 +509,7 @@ class BucketBossApp:
             # Use cached data if available and not expired
             entry = self.cache.get(prefix)
             if entry and time.time() - entry[2] < CACHE_TTL_SECONDS:
+                # Cache hit
                 print(f"[Cache hit: {prefix}]", file=sys.stderr)
                 directories, files = entry[0], entry[1]
                 # Re-sort cached files if needed (cache stores unsorted)
