@@ -15,6 +15,7 @@ from abc import ABC, abstractmethod # For Abstract Base Class
 from itertools import islice
 import time
 import json # For saving/loading cache
+import collections # For Counter in stats
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
@@ -880,20 +881,61 @@ class BucketBossApp:
         print("\nUse TAB for completion.")
         
     def do_stats(self, *args):
-        """Display collected bucket statistics."""
-        status = self.stats_result.get("status", "unknown")
+        """Display collected bucket statistics and cached content summary."""
         
-        if status == "pending" or status == "loading":
-            print("Stats collection initiated in background, not yet complete...")
-        elif status == "error":
-            print(f"Error collecting stats: {self.stats_result.get('error_message', 'Unknown error')}")
-        elif status == "complete":
-            print("Bucket Stats (collected in background):")
+        # --- Provider-Specific Stats (from background thread) ---
+        provider_status = self.stats_result.get("status", "unknown")
+        print("--- Provider Bucket Stats ---")
+        if provider_status == "pending" or provider_status == "loading":
+            print("  Status: Collection in progress...")
+        elif provider_status == "error":
+            print(f"  Status: Error collecting provider stats - {self.stats_result.get('error_message', 'Unknown error')}")
+        elif provider_status == "complete":
+            print("  Status: Complete (collected in background)")
             for key, value in self.stats_result.items():
                 if key not in ["status", "error_message"]: # Don't print meta keys
                     print(f"  {key}: {value}")
         else:
-            print(f"Stats status unknown: {status}")
+            print(f"  Status: Unknown ({provider_status})")
+        
+        # --- Cached Content Stats ---
+        print("\n--- Cached Content Stats (reflects browsed/crawled data) ---")
+        if not self.cache:
+            print("  Cache is empty. Browse directories to populate.")
+            return
+
+        cached_dirs = set()
+        file_type_counts = collections.Counter()
+        total_cached_files = 0
+        total_cached_size_bytes = 0
+
+        for prefix, (dirs, files, timestamp) in self.cache.items():
+            # The prefix itself is a directory if it ends with '/' or is empty (root)
+            if prefix == '' or prefix.endswith('/'):
+                cached_dirs.add(prefix)
+            
+            for d_name in dirs:
+                cached_dirs.add(prefix + d_name + '/') # Add full path of subdirectory
+            
+            for f_info in files:
+                ext = f_info.get('extension', '.<no_ext>')
+                if not ext: ext = '.<no_ext>' # Ensure empty extensions are counted
+                file_type_counts[ext] += 1
+                total_cached_files += 1
+                total_cached_size_bytes += f_info.get('size', 0)
+
+        print(f"  Unique Cached Directories: {len(cached_dirs)}")
+        print(f"  Total Cached Files: {total_cached_files}")
+        print(f"  Total Cached Files Size: {self._human_readable_size(total_cached_size_bytes)}")
+        
+        if file_type_counts:
+            print("  File Types (by extension):")
+            # Sort by count descending, then by extension name
+            sorted_file_types = sorted(file_type_counts.items(), key=lambda item: (-item[1], item[0]))
+            for ext, count in sorted_file_types:
+                print(f"    {ext if ext else '<no_extension>'}: {count}")
+        else:
+            print("  File Types (by extension): No files found in cache.")
 
     def do_crawl_status(self, *args):
         """Display the status of the background cache crawl."""
