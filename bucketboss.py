@@ -1035,10 +1035,10 @@ def crawl_prefix_recursive(provider: CloudProvider, cache: dict, status_dict: di
     entry = cache.get(prefix)
     if entry and time.time() - entry[2] < CACHE_TTL_SECONDS:
         dirs = entry[0]
-        print(f"[Crawl: Using cached prefix '{prefix or '<root>'}' at depth {current_depth}]", file=sys.stderr)
+        # print(f"[Crawl: Using cached prefix '{prefix or '<root>'}' at depth {current_depth}]", file=sys.stderr)
     else:
         try:
-            print(f"[Crawl: Fetching prefix '{prefix or '<root>'}' at depth {current_depth}]", file=sys.stderr)
+            # print(f"[Crawl: Fetching prefix '{prefix or '<root>'}' at depth {current_depth}]", file=sys.stderr)
             dirs, files = provider.list_objects(prefix)
             cache[prefix] = (dirs, files, time.time())
             status_dict["cached_prefixes"] = status_dict.get("cached_prefixes", 0) + 1
