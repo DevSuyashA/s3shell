@@ -23,6 +23,10 @@ from prompt_toolkit.shortcuts import CompleteStyle
 from prompt_toolkit.styles import Style
 from prompt_toolkit.patch_stdout import patch_stdout
 
+# For single character input in pagination
+import tty
+import termios
+
 from botocore.exceptions import ClientError
 from datetime import datetime
 
@@ -461,6 +465,19 @@ class BucketBossApp:
         print("Exiting...")
         return False
 
+    def _get_single_char_input(self, prompt_message: str) -> str:
+        """Gets a single character input from the terminal without requiring Enter."""
+        sys.stdout.write(prompt_message)
+        sys.stdout.flush()
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(sys.stdin.fileno())
+            char = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return char.lower()
+
     def _get_cache_file_path(self):
         """Constructs the path for the cache file."""
         cache_dir = os.path.join(os.path.expanduser("~"), ".bucketboss_cache")
@@ -623,17 +640,23 @@ class BucketBossApp:
                 # Check if page limit reached
                 if line_count >= page_limit and line_count < len(all_entries):
                     try:
-                        more_prompt = "--More-- (Enter: next page, q: quit)"
-                        choice = input(more_prompt).strip().lower()
-                        # Erase the prompt line after input
-                        print("\033[F\033[K", end='') 
+                        more_prompt = "--More-- (Press q to quit, any other key for next page)"
+                        # Add a space for visual separation before cursor
+                        choice = self._get_single_char_input(more_prompt + " ")
+                        # Erase the prompt line: move to beginning, clear line
+                        sys.stdout.write("\r\033[K")
+                        sys.stdout.flush()
+
                         if choice == 'q':
-                             print("[Listing aborted by user]")
-                             break
-                        line_count = 0 # Reset for next page
+                            print("[Listing aborted by user]")
+                            break
+                        line_count = 0 # Reset for next page (for any key other than 'q')
                     except (KeyboardInterrupt, EOFError):
-                         print("\n[Listing aborted by user]")
-                         break # Exit loop on Ctrl+C/Ctrl+D during prompt
+                        # Print newline to ensure next prompt is on a new line after ^C
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        print("[Listing aborted by user]")
+                        break # Exit loop on Ctrl+C/Ctrl+D during prompt
             # --- End Pagination Logic ---
 
         except Exception as e:
@@ -744,15 +767,22 @@ class BucketBossApp:
                  
                  if line_count >= page_limit and i < len(lines) - 1:
                       try:
-                           more_prompt = "--More-- (Enter: next page, q: quit)"
-                           choice = input(more_prompt).strip().lower()
-                           print("\033[F\033[K", end='') # Erase prompt
+                           more_prompt = "--More-- (Press q to quit, any other key for next page)"
+                           # Add a space for visual separation before cursor
+                           choice = self._get_single_char_input(more_prompt + " ")
+                           # Erase the prompt line: move to beginning, clear line
+                           sys.stdout.write("\r\033[K")
+                           sys.stdout.flush()
+
                            if choice == 'q':
                                 print("[Output aborted by user]")
                                 break
-                           line_count = 0 # Reset for next page
+                           line_count = 0 # Reset for next page (for any key other than 'q')
                       except (KeyboardInterrupt, EOFError):
-                           print("\n[Output aborted by user]")
+                           # Print newline to ensure next prompt is on a new line after ^C
+                           sys.stdout.write("\n")
+                           sys.stdout.flush()
+                           print("[Output aborted by user]")
                            break
             # --- End Pagination Logic --- 
             
