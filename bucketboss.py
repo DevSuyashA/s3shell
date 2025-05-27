@@ -692,20 +692,13 @@ class BucketBossApp:
                  target_dir_name = potential_new_prefix.rstrip('/').split('/')[-1]
                  
             # If target is '..', resolve first then check parent of resolved
-            parent_to_check = original_prefix
+            parent_to_check = original_prefix # This is for the 'else' branch if target_dir_name is not '..'
             if target_dir_name == '..':
-                # Already resolved by provider.resolve_path, just check existence of potential_new_prefix
-                # We can list potential_new_prefix itself and see if it works
-                 try:
-                      print(f"[Validating prefix: {potential_new_prefix}]", file=sys.stderr)
-                      self.provider.list_objects(potential_new_prefix) # Check if listing works
-                      # If list_objects succeeds (doesn't raise), assume it's valid
-                      self.current_prefix = potential_new_prefix
-                      print(f"Changed directory to: {self.current_prefix or '/'}")
-                      return
-                 except Exception as e_check:
-                      print(f"Error: Cannot cd to '{potential_new_prefix}': {e_check}")
-                      return
+                # For '..', provider.resolve_path has already given the correct parent.
+                # No need to list the target prefix to validate it.
+                self.current_prefix = potential_new_prefix
+                print(f"Changed directory to: {self.current_prefix or '/'}")
+                return
             elif potential_new_prefix == '/' or potential_new_prefix == '': # Target is root
                 parent_to_check = '' # Check root contents
                 target_dir_name = path_arg.strip('/') # Check if root was the target
