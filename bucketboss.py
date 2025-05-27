@@ -14,6 +14,7 @@ import fnmatch  # For wildcard pattern matching
 from abc import ABC, abstractmethod # For Abstract Base Class
 from itertools import islice
 import time
+import json # For saving/loading cache
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
@@ -377,7 +378,8 @@ class BucketBossApp:
         # self.bucket_name = bucket_name # Now obtained via provider if needed
         # self.s3_client = s3_client # Now accessed via provider
         self.current_prefix = '' # Provider paths are relative to this
-        self.cache = {}  # {prefix: (directories, files)} - cache remains here
+        self.cache = {}  # {prefix: (directories, files, timestamp)}
+        self._load_cache() # Load cache from disk
         self.history = FileHistory(os.path.join(os.path.expanduser("~"), ".bucketboss_history")) # Renamed history
         self.session = PromptSession(
             history=self.history,
@@ -454,8 +456,74 @@ class BucketBossApp:
     # --- Command Implementations (Delegate to Provider) ---
     def do_exit(self, *args):
         """Exit the shell."""
+        print("Saving cache...")
+        self._save_cache()
         print("Exiting...")
         return False
+
+    def _get_cache_file_path(self):
+        """Constructs the path for the cache file."""
+        cache_dir = os.path.join(os.path.expanduser("~"), ".bucketboss_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        # Assuming provider has a bucket_name attribute for unique cache files
+        bucket_identifier = getattr(self.provider, 'bucket_name', 'default_bucket')
+        return os.path.join(cache_dir, f"{bucket_identifier}.cache.json")
+
+    def _load_cache(self):
+        """Loads the cache from a file."""
+        cache_file = self._get_cache_file_path()
+        try:
+            if os.path.exists(cache_file):
+                with open(cache_file, 'r') as f:
+                    loaded_data = json.load(f)
+                
+                self.cache = {}
+                for prefix, entry in loaded_data.items():
+                    dirs, files_serializable, timestamp = entry
+                    # Convert last_modified from ISO string back to datetime
+                    files = []
+                    for file_info_s in files_serializable:
+                        file_info = file_info_s.copy()
+                        if 'last_modified' in file_info and isinstance(file_info['last_modified'], str):
+                            try:
+                                file_info['last_modified'] = datetime.fromisoformat(file_info['last_modified'])
+                            except ValueError:
+                                # Handle cases where conversion might fail, e.g., old format or bad data
+                                # Fallback to current time or a placeholder if necessary
+                                print(f"Warning: Could not parse date '{file_info['last_modified']}' for {prefix}{file_info.get('name','')}. Using current time.", file=sys.stderr)
+                                file_info['last_modified'] = datetime.now() 
+                        files.append(file_info)
+                    self.cache[prefix] = (dirs, files, timestamp)
+                print(f"Loaded cache from {cache_file}", file=sys.stderr)
+        except (FileNotFoundError, json.JSONDecodeError, TypeError) as e:
+            print(f"Could not load cache from {cache_file}: {e}. Starting with an empty cache.", file=sys.stderr)
+            self.cache = {}
+        except Exception as e:
+            print(f"Unexpected error loading cache: {e}. Starting with an empty cache.", file=sys.stderr)
+            self.cache = {}
+
+
+    def _save_cache(self):
+        """Saves the current cache to a file."""
+        cache_file = self._get_cache_file_path()
+        try:
+            # Prepare cache for JSON serialization (convert datetime to ISO string)
+            serializable_cache = {}
+            for prefix, entry in self.cache.items():
+                dirs, files, timestamp = entry
+                files_serializable = []
+                for file_info in files:
+                    file_info_s = file_info.copy()
+                    if 'last_modified' in file_info_s and isinstance(file_info_s['last_modified'], datetime):
+                        file_info_s['last_modified'] = file_info_s['last_modified'].isoformat()
+                    files_serializable.append(file_info_s)
+                serializable_cache[prefix] = (dirs, files_serializable, timestamp)
+
+            with open(cache_file, 'w') as f:
+                json.dump(serializable_cache, f, indent=2)
+            print(f"Saved cache to {cache_file}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error saving cache to {cache_file}: {e}", file=sys.stderr)
 
     def do_ls(self, *args):
         """List objects using the cloud provider."""
