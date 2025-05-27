@@ -583,9 +583,8 @@ class BucketBossApp:
                     # Found the file, display entry and return
                     print(self._format_file_entry(f, detailed))
                     return
-            # If not found, it's not a file—error out
-            print(f"Error: '{path}' is not a directory or file not found.")
-            return
+            # If not found as a file, do not error out here.
+            # Instead, let the code fall through to attempt listing it as a directory.
 
         # Use provider to resolve path
         prefix = self.provider.resolve_path(self.current_prefix, path, is_directory=True)
