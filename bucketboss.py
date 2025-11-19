@@ -12,16 +12,15 @@ import sys
 import threading # Import threading
 import fnmatch  # For wildcard pattern matching
 from abc import ABC, abstractmethod # For Abstract Base Class
-from itertools import islice
 import time
 import json # For saving/loading cache
 import collections # For Counter in stats
+from typing import Optional, Tuple, List # Type hinting
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.shortcuts import CompleteStyle
-from prompt_toolkit.styles import Style
 from prompt_toolkit.patch_stdout import patch_stdout
 
 # For single character input in pagination
@@ -48,7 +47,7 @@ class CloudProvider(ABC):
         pass
 
     @abstractmethod
-    def list_objects(self, prefix: str, sort_key: str = 'name') -> tuple[list[str], list[dict]]:
+    def list_objects(self, prefix: str, sort_key: str = 'name', limit: Optional[int] = None, next_token: Optional[str] = None) -> Tuple[List[str], List[dict], Optional[str]]:
         """List directories (prefixes) and files (objects) under a given prefix."""
         pass
 
@@ -71,6 +70,16 @@ class CloudProvider(ABC):
     def upload_file(self, local_path: str, key: str):
         """Upload a local file to a specific object key."""
         pass
+
+    @abstractmethod
+    def read_object_range(self, key: str, size: int) -> bytes:
+        """Read the first 'size' bytes of an object."""
+        pass
+
+    @abstractmethod
+    def get_object_metadata(self, key: str) -> dict:
+        """Get metadata for an object (size, last_modified, content_type)."""
+        pass
         
     @abstractmethod
     def get_bucket_stats(self) -> dict:
@@ -90,26 +99,32 @@ class S3Provider(CloudProvider):
         # This might raise ClientError if bucket not found or no permission
         self.s3_client.head_bucket(Bucket=self.bucket_name)
 
-    def list_objects(self, prefix: str, sort_key: str = 'name') -> tuple[list[str], list[dict]]:
+    def list_objects(self, prefix: str, sort_key: str = 'name', limit: Optional[int] = None, next_token: Optional[str] = None) -> Tuple[List[str], List[dict], Optional[str]]:
         directories = []
         files = []
-        # Original list_objects logic using self.s3_client and self.bucket_name
+        next_continuation_token = None
+        
         try:
-            paginator = self.s3_client.get_paginator('list_objects_v2')
-            operation_parameters = {
-                'Bucket': self.bucket_name,
-                'Prefix': prefix,
-                'Delimiter': '/',
-            }
-            
-            for page in paginator.paginate(**operation_parameters):
-                for cp in page.get('CommonPrefixes', []):
+            if limit is not None:
+                # Manual pagination: fetch single page
+                kwargs = {
+                    'Bucket': self.bucket_name,
+                    'Prefix': prefix,
+                    'Delimiter': '/'
+                }
+                kwargs['MaxKeys'] = limit
+                if next_token:
+                    kwargs['ContinuationToken'] = next_token
+                
+                response = self.s3_client.list_objects_v2(**kwargs)
+                
+                for cp in response.get('CommonPrefixes', []):
                     dir_path = cp['Prefix']
                     dir_name = dir_path[len(prefix):].rstrip('/')
                     if dir_name:
                         directories.append(dir_name)
                 
-                for obj in page.get('Contents', []):
+                for obj in response.get('Contents', []):
                     file_key = obj['Key']
                     if file_key == prefix:
                         continue 
@@ -121,7 +136,39 @@ class S3Provider(CloudProvider):
                             'last_modified': obj['LastModified'],
                             'extension': os.path.splitext(file_name)[1].lower()
                         })
-            
+                
+                next_continuation_token = response.get('NextContinuationToken')
+                
+            else:
+                # Original behavior: Fetch ALL pages
+                paginator = self.s3_client.get_paginator('list_objects_v2')
+                operation_parameters = {
+                    'Bucket': self.bucket_name,
+                    'Prefix': prefix,
+                    'Delimiter': '/',
+                }
+                
+                for page in paginator.paginate(**operation_parameters):
+                    for cp in page.get('CommonPrefixes', []):
+                        dir_path = cp['Prefix']
+                        dir_name = dir_path[len(prefix):].rstrip('/')
+                        if dir_name:
+                            directories.append(dir_name)
+                    
+                    for obj in page.get('Contents', []):
+                        file_key = obj['Key']
+                        if file_key == prefix:
+                            continue 
+                        file_name = file_key[len(prefix):]
+                        if file_name:
+                            files.append({
+                                'name': file_name,
+                                'size': obj['Size'],
+                                'last_modified': obj['LastModified'],
+                                'extension': os.path.splitext(file_name)[1].lower()
+                            })
+                next_continuation_token = None
+
             directories.sort()
             if sort_key == 'name':
                 files.sort(key=lambda x: x['name'])
@@ -130,7 +177,7 @@ class S3Provider(CloudProvider):
             elif sort_key == 'size':
                 files.sort(key=lambda x: x['size'], reverse=True)
             
-            return directories, files
+            return directories, files, next_continuation_token
             
         except ClientError as e:
              error_code = e.response.get('Error', {}).get('Code', 'Unknown')
@@ -178,6 +225,21 @@ class S3Provider(CloudProvider):
     def upload_file(self, local_path: str, key: str):
         # May raise ClientError
         self.s3_client.upload_file(local_path, self.bucket_name, key)
+
+    def read_object_range(self, key: str, size: int) -> bytes:
+        if size <= 0:
+            raise ValueError(f"Size must be positive, got: {size}")
+        # Range is inclusive, so 0-(size-1)
+        response = self.s3_client.get_object(Bucket=self.bucket_name, Key=key, Range=f'bytes=0-{size-1}')
+        return response['Body'].read()
+
+    def get_object_metadata(self, key: str) -> dict:
+        response = self.s3_client.head_object(Bucket=self.bucket_name, Key=key)
+        return {
+            'size': response['ContentLength'],
+            'last_modified': response['LastModified'],
+            'content_type': response.get('ContentType', 'application/octet-stream')
+        }
         
     def get_bucket_stats(self) -> dict:
         """Get S3 bucket location and creation date."""
@@ -216,10 +278,10 @@ class S3Provider(CloudProvider):
                  # If we already have a date, don't overwrite with an error unless necessary
                  if 'CreationDate' not in stats:
                       stats['CreationDate'] = f"Error: {e_date.response.get('Error', {}).get('Code', 'Unknown')}"
-            except Exception as e_date_other: # Catch unexpected errors here
+            except Exception: # Catch unexpected errors here
                  if 'CreationDate' not in stats:
                       # Use a generic message instead of trying str(e_date_other)
-                      stats['CreationDate'] = f"Unexpected error processing creation date data."
+                      stats['CreationDate'] = "Unexpected error processing creation date data."
 
             # --- Size Placeholder --- 
             stats['Size'] = "N/A (Requires separate calculation)"
@@ -232,6 +294,109 @@ class S3Provider(CloudProvider):
              if 'CreationDate' not in stats: stats['CreationDate'] = "Error retrieving"
              if 'Size' not in stats: stats['Size'] = "N/A"
              
+        return stats
+
+# --- Multi-Bucket Mode Provider ---
+class MultiBucketProvider(CloudProvider):
+    """Provider that lists all buckets at root, then delegates to single-bucket provider."""
+    def __init__(self, s3_client):
+        self.s3_client = s3_client
+
+    def get_prompt_prefix(self) -> str:
+        return "s3://"
+
+    def head_bucket(self):
+        # Validate access by listing buckets
+        self.s3_client.list_buckets()
+
+    def list_objects(self, prefix: str, sort_key: str = 'name', limit: Optional[int] = None, next_token: Optional[str] = None) -> Tuple[List[str], List[dict], Optional[str]]:
+        # Root level lists buckets
+        if prefix == '':
+            try:
+                resp = self.s3_client.list_buckets()
+                buckets = [b['Name'] for b in resp.get('Buckets', [])]
+                buckets.sort()
+                # Pagination not supported for root buckets in this simple view
+                return buckets, [], None 
+            except Exception as e:
+                print(f"Error listing buckets: {e}", file=sys.stderr)
+                return [], [], None
+        # Delegate to S3Provider for bucket contents
+        # Expect prefix like 'bucket_name/...'
+        bucket_name, _, sub_prefix = prefix.partition('/')
+        s3p = S3Provider(bucket_name, self.s3_client)
+        return s3p.list_objects(sub_prefix, sort_key, limit, next_token)
+
+    def resolve_path(self, current_prefix: str, input_path: str, is_directory: bool = False) -> str:
+        # Combine paths and normalize
+        if input_path.startswith('/'):
+            path = input_path.lstrip('/')
+        else:
+            path = (current_prefix or '') + input_path
+        parts = path.split('/')
+        normalized = []
+        for part in parts:
+            if part == '..':
+                if normalized:
+                    normalized.pop()
+            elif part and part != '.':
+                normalized.append(part)
+        new_path = '/'.join(normalized)
+        if is_directory and new_path:
+            new_path += '/'
+        elif not is_directory and new_path.endswith('/'):
+            new_path = new_path.rstrip('/')
+        return new_path
+
+    def get_object(self, key: str) -> bytes:
+        # Delegate to specific bucket S3Provider
+        key = key.lstrip('/')
+        bucket_name, _, subkey = key.partition('/')
+        if not bucket_name:
+            raise ValueError(f"Invalid S3 key, missing bucket name: '{key}'")
+        s3p = S3Provider(bucket_name, self.s3_client)
+        return s3p.get_object(subkey)
+
+    def download_file(self, key: str, local_path: str):
+        key = key.lstrip('/')
+        bucket_name, _, subkey = key.partition('/')
+        if not bucket_name:
+            raise ValueError(f"Invalid S3 key, missing bucket name: '{key}'")
+        s3p = S3Provider(bucket_name, self.s3_client)
+        s3p.download_file(subkey, local_path)
+
+    def upload_file(self, local_path: str, key: str):
+        key = key.lstrip('/')
+        bucket_name, _, subkey = key.partition('/')
+        if not bucket_name:
+            raise ValueError(f"Invalid S3 key, missing bucket name: '{key}'")
+        s3p = S3Provider(bucket_name, self.s3_client)
+        s3p.upload_file(local_path, subkey)
+
+    def read_object_range(self, key: str, size: int) -> bytes:
+        key = key.lstrip('/')
+        bucket_name, _, subkey = key.partition('/')
+        if not bucket_name:
+            raise ValueError(f"Invalid S3 key, missing bucket name: '{key}'")
+        s3p = S3Provider(bucket_name, self.s3_client)
+        return s3p.read_object_range(subkey, size)
+
+    def get_object_metadata(self, key: str) -> dict:
+        key = key.lstrip('/')
+        bucket_name, _, subkey = key.partition('/')
+        if not bucket_name:
+            raise ValueError(f"Invalid S3 key, missing bucket name: '{key}'")
+        s3p = S3Provider(bucket_name, self.s3_client)
+        return s3p.get_object_metadata(subkey)
+
+    def get_bucket_stats(self) -> dict:
+        # Provide count of buckets at root level
+        stats = {}
+        try:
+            resp = self.s3_client.list_buckets()
+            stats['BucketCount'] = len(resp.get('Buckets', []))
+        except Exception as e:
+            stats['BucketCount'] = f"Error: {e}"
         return stats
 
 # --- BucketBoss Completer --- (Formerly S3Completer)
@@ -248,12 +413,14 @@ class BucketBossCompleter(Completer):
         """Helper to get remote directory and file suggestions for a given prefix."""
         try:
             # Use centralized app-level list_objects for TTL caching
-            dirs, files = self.app.list_objects(prefix_to_list)
+            # NOTE: Completer always fetches ALL (limit=None) to ensure we find the match
+            # This might be slow for huge directories.
+            dirs, files, _ = self.app.list_objects(prefix_to_list)
             suggestions = [d + '/' for d in dirs]
             if include_files:
                 suggestions += [f['name'] for f in files]
             return suggestions
-        except Exception as e:
+        except Exception:
             # print(f"Error getting remote suggestions: {e}", file=sys.stderr)
             return []
 
@@ -284,7 +451,7 @@ class BucketBossCompleter(Completer):
                     else:
                         completions.append(completion_text)
             return completions
-        except Exception as e:
+        except Exception:
             # print(f"Error getting local suggestions: {e}", file=sys.stderr)
             return []
 
@@ -404,6 +571,8 @@ class BucketBossApp:
             'stats': self.do_stats,
             'crawlstatus': self.do_crawl_status, # Add crawl status command
             'get': self.do_get,
+            'peek': self.do_peek,
+            'audit': self.do_audit,
         }
         # Initialize placeholder for background stats collection
         self.stats_result = {"status": "pending"}
@@ -578,7 +747,8 @@ class BucketBossApp:
             else:
                 parent_prefix = ''
             # List parent to get file metadata
-            _, files = self.list_objects(parent_prefix)
+            # Use limit=None to ensure we find the file
+            _, files, _ = self.list_objects(parent_prefix)
             for f in files:
                 if f['name'] == os.path.basename(file_key):
                     # Found the file, display entry and return
@@ -591,73 +761,53 @@ class BucketBossApp:
         prefix = self.provider.resolve_path(self.current_prefix, path, is_directory=True)
         
         try:
-            # Use cached data if available and not expired
-            entry = self.cache.get(prefix)
-            if entry and time.time() - entry[2] < CACHE_TTL_SECONDS:
-                # Cache hit
-                print(f"[Cache hit: {prefix}]", file=sys.stderr)
-                directories, files = entry[0], entry[1]
-                # Re-sort cached files if needed (cache stores unsorted)
-                if sort_key == 'date':
-                    files.sort(key=lambda x: x['last_modified'], reverse=True)
-                elif sort_key == 'size':
-                    files.sort(key=lambda x: x['size'], reverse=True)
-                else: # Default name sort
-                    files.sort(key=lambda x: x['name'])
-                # Directories are assumed to be stored sorted in cache
-            else:
-                print(f"[Fetch: {prefix}]", file=sys.stderr)
-                # Fetch fresh data and update cache
-                directories, files = self.provider.list_objects(prefix, sort_key)
-                self.cache[prefix] = (directories, files, time.time())
+            # Pagination Loop
+            next_token = None
+            limit = 50 # Page size
             
-            all_entries = [
-                *((d, 'dir') for d in directories),
-                *((f, 'file') for f in files)
-            ]
-
-            if not all_entries:
-                 print("No objects found.")
-                 return
-            
-            # --- Pagination Logic --- 
-            try:
-                 term_height = os.get_terminal_size().lines
-                 # Leave room for prompt, input, and messages
-                 page_limit = max(1, term_height - 3) 
-            except OSError: # Handle environments without a TTY
-                 term_height = float('inf')
-                 page_limit = float('inf')
-            
-            line_count = 0
-            for entry, entry_type in all_entries:
-                if entry_type == 'dir':
-                    print(self._format_dir_entry(entry))
-                else:
-                    print(self._format_file_entry(entry, detailed))
-                line_count += 1
+            while True:
+                # Use cached data if available and not expired (only if limit is None/default call)
+                # BUT here we want pagination.
+                # self.list_objects now handles limit/token. 
+                # If we use the App wrapper, it might return cached FULL results.
                 
-                # Check if page limit reached
-                if line_count >= page_limit and line_count < len(all_entries):
-                    try:
-                        more_prompt = "--More-- (Press q to quit, any other key for next page)"
-                        # Add a space for visual separation before cursor
-                        choice = self._get_single_char_input(more_prompt + " ")
-                        # Erase the prompt line: move to beginning, clear line
-                        sys.stdout.write("\r\033[K")
-                        sys.stdout.flush()
+                # Strategy: Try to get from App wrapper (which caches full results).
+                # If cache hit, show all (using pager).
+                # If cache miss, use provider directly with pagination? 
+                # No, stick to App wrapper but update it to handle arguments.
+                
+                # For now, let's try to use the App wrapper with explicit limit.
+                # If limit is provided, the wrapper (updated below) should probably bypass cache or handle it.
+                
+                dirs, files, next_token = self.list_objects(prefix, sort_key, limit=limit, next_token=next_token)
+                
+                all_entries = [
+                    *((d, 'dir') for d in dirs),
+                    *((f, 'file') for f in files)
+                ]
 
-                        if choice == 'q':
-                            print("[Listing aborted by user]")
-                            break
-                        line_count = 0 # Reset for next page (for any key other than 'q')
-                    except (KeyboardInterrupt, EOFError):
-                        # Print newline to ensure next prompt is on a new line after ^C
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
-                        print("[Listing aborted by user]")
-                        break # Exit loop on Ctrl+C/Ctrl+D during prompt
-            # --- End Pagination Logic ---
+                if not all_entries and next_token is None:
+                     print("No objects found.")
+                     break
+
+                # Display current page
+                lines = []
+                for entry, entry_type in all_entries:
+                    if entry_type == 'dir':
+                        lines.append(self._format_dir_entry(entry))
+                    else:
+                        lines.append(self._format_file_entry(entry, detailed))
+                
+                print('\n'.join(lines))
+                
+                if next_token:
+                    print(f"--- More ({len(all_entries)} items displayed) --- Press 'q' to quit, any other key for next page...")
+                    choice = self._get_single_char_input("")
+                    if choice == 'q':
+                        break
+                    # Continue to next iteration with next_token
+                else:
+                    break
 
         except Exception as e:
              print(f"Error during ls: {e}") # Provider should handle specific errors
@@ -714,8 +864,9 @@ class BucketBossApp:
                  target_dir_name = potential_new_prefix.rstrip('/').split('/')[-1]
                  
             # List the parent directory to find the target
+            # Use standard call (fetch all) for validation
             print(f"[Checking parent: '{parent_to_check or '<root>'}' for '{target_dir_name}']", file=sys.stderr)
-            parent_dirs, _ = self.list_objects(parent_to_check)
+            parent_dirs, _, _ = self.list_objects(parent_to_check)
             
             # 3. Check if the target directory name is in the list from the parent
             if target_dir_name in parent_dirs:
@@ -727,113 +878,6 @@ class BucketBossApp:
 
         except Exception as e:
              print(f"Error changing directory: {e}")
-
-    def do_cat(self, *args):
-        """Display the contents of a text-based object using the provider."""
-        if len(args) != 1:
-            print("Usage: cat <object_key>")
-            return
-        object_key_arg = args[0]
-        # Use provider to resolve path
-        object_key = self.provider.resolve_path(self.current_prefix, object_key_arg, is_directory=False)
-        if not object_key or object_key.endswith('/'):
-            print("Error: Invalid file path for cat.")
-            return
-        try:
-            # Use provider to get object content
-            content_bytes = self.provider.get_object(object_key)
-            content = content_bytes.decode('utf-8')
-            
-            # --- Pagination Logic for Cat --- 
-            lines = content.splitlines()
-            try:
-                 term_height = os.get_terminal_size().lines
-                 page_limit = max(1, term_height - 2) # Leave room for prompt
-            except OSError:
-                 term_height = float('inf')
-                 page_limit = float('inf')
-                 
-            line_count = 0
-            for i, line in enumerate(lines):
-                 print(line)
-                 line_count += 1
-                 
-                 if line_count >= page_limit and i < len(lines) - 1:
-                      try:
-                           more_prompt = "--More-- (Press q to quit, any other key for next page)"
-                           # Add a space for visual separation before cursor
-                           choice = self._get_single_char_input(more_prompt + " ")
-                           # Erase the prompt line: move to beginning, clear line
-                           sys.stdout.write("\r\033[K")
-                           sys.stdout.flush()
-
-                           if choice == 'q':
-                                print("[Output aborted by user]")
-                                break
-                           line_count = 0 # Reset for next page (for any key other than 'q')
-                      except (KeyboardInterrupt, EOFError):
-                           # Print newline to ensure next prompt is on a new line after ^C
-                           sys.stdout.write("\n")
-                           sys.stdout.flush()
-                           print("[Output aborted by user]")
-                           break
-            # --- End Pagination Logic --- 
-            
-        except ClientError as e:
-            # Catch S3 specific error for example, but should be general
-            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-            if error_code == 'NoSuchKey':
-                 print(f"Error: Object not found: {object_key}")
-            else:
-                 print(f"Error accessing object: {error_code}")
-        except UnicodeDecodeError:
-            print("Error: Unable to decode the object as text (likely binary file). Try 'open'.")
-        except Exception as e:
-            print(f"Error during cat: {e}")
-
-    def do_open(self, *args):
-        """Download and open an object using the provider."""
-        if len(args) != 1:
-            print("Usage: open <object_key>")
-            return
-        object_key_arg = args[0]
-        # Use provider to resolve path
-        object_key = self.provider.resolve_path(self.current_prefix, object_key_arg, is_directory=False)
-        if not object_key or object_key.endswith('/'):
-            print("Error: Invalid file path for open.")
-            return
-        
-        temp_file = None
-        try:
-            base_name = os.path.basename(object_key) or "downloaded_file"
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{base_name}")
-            temp_path = temp_file.name
-            temp_file.close() 
-
-            print(f"Downloading {object_key} to temporary file...")
-            # Use provider to download
-            self.provider.download_file(object_key, temp_path)
-            print(f"Opening {temp_path}...")
-
-            if platform.system() == 'Windows':
-                os.startfile(temp_path)
-            elif platform.system() == 'Darwin': 
-                subprocess.run(['open', temp_path], check=True)
-            else: 
-                subprocess.run(['xdg-open', temp_path], check=True)
-
-        except ClientError as e: # Example S3 error
-            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-            print(f"Error accessing object: {error_code}")
-            if temp_file: os.unlink(temp_path) 
-        except FileNotFoundError:
-             print(f"Error: Could not find system command ('open' or 'xdg-open').")
-             if temp_file: os.unlink(temp_path) 
-        except subprocess.CalledProcessError as e:
-             print(f"Error opening file with system command: {e}")
-        except Exception as e:
-            print(f"Error during open: {e}")
-            if temp_file: os.unlink(temp_path) 
 
     def do_put(self, *args):
         """Upload a local file using the provider."""
@@ -862,7 +906,7 @@ class BucketBossApp:
             print(f"Uploading {local_path} to {target_key}...")
             # Use provider to upload
             self.provider.upload_file(local_path, target_key)
-            print(f"Upload successful.")
+            print("Upload successful.")
             # Invalidate cache for the directory containing the uploaded file
             self.invalidate_cache_for_key(target_key)
 
@@ -955,21 +999,33 @@ class BucketBossApp:
              print(f"Crawl status unknown: {status}")
 
     # --- Formatting and Cache Helpers (Remain mostly internal to App) ---
-    def list_objects(self, prefix, sort_key='name'):
+    def list_objects(self, prefix, sort_key='name', limit: Optional[int] = None, next_token: Optional[str] = None):
        # This app-level method now primarily manages the cache
        # It calls the provider's list_objects if needed
-       entry = self.cache.get(prefix)
-       if entry and time.time() - entry[2] < CACHE_TTL_SECONDS:
-            return entry[0], entry[1]
-       else:
-            try:
+       
+       # If limit/pagination is used, bypass cache reading (safe default)
+       # or only use cache if we are at the start and have a full cache?
+       if limit is None and next_token is None:
+           entry = self.cache.get(prefix)
+           if entry and time.time() - entry[2] < CACHE_TTL_SECONDS:
+                return entry[0], entry[1], None # Return cached data with no token
+       
+       # If we are here, we are either paginating OR cache miss OR cache expired
+       try:
+            # Only print [Fetch] if it's a fresh fetch (limit=None or first page)
+            if not next_token:
                  print(f"[Fetch: {prefix}]", file=sys.stderr)
-                 dirs, files = self.provider.list_objects(prefix, sort_key)
-                 self.cache[prefix] = (dirs, files, time.time())
-                 return dirs, files
-            except Exception as e:
-                 # Error already printed by provider, just return empty
-                 return [], []
+            
+            dirs, files, token = self.provider.list_objects(prefix, sort_key, limit=limit, next_token=next_token)
+            
+            # Only cache if we fetched EVERYTHING (limit is None)
+            if limit is None:
+                self.cache[prefix] = (dirs, files, time.time())
+                
+            return dirs, files, token
+       except Exception:
+            # Error already printed by provider, just return empty
+            return [], [], None
 
     def _format_dir_entry(self, dir_name):
         icon = '📁 ' if platform.system() != 'Windows' else ''
@@ -1023,7 +1079,7 @@ class BucketBossApp:
             del self.cache[parent_prefix]
         # Also invalidate root if parent is root
         if parent_prefix == '' and '' in self.cache:
-             print(f"[Cache invalidated for: <root>]", file=sys.stderr)
+             print("[Cache invalidated for: <root>]", file=sys.stderr)
              del self.cache['']
 
     def do_get(self, *args):
@@ -1045,7 +1101,7 @@ class BucketBossApp:
                 pattern = remote_path_arg
             prefix = self.provider.resolve_path(self.current_prefix, dir_part, is_directory=True)
             # List objects under prefix
-            _, files = self.list_objects(prefix)
+            _, files, _ = self.list_objects(prefix)
             names = [f['name'] for f in files]
             matches = fnmatch.filter(names, pattern)
             if not matches:
@@ -1099,9 +1155,156 @@ class BucketBossApp:
         except Exception as e:
             print(f"Error during get: {e}")
 
+    def do_peek(self, *args):
+        """Peek at the first few bytes of a file (default 2KB). Usage: peek <file> [bytes]"""
+        if not args:
+            print("Usage: peek <file> [bytes]")
+            return
+        
+        path = args[0]
+        size = 2048 # Default 2KB
+        if len(args) > 1:
+            try:
+                size = int(args[1])
+                if size > 10 * 1024 * 1024:  # 10MB limit
+                    print("Error: Size limit is 10MB for peek")
+                    return
+                if size <= 0:
+                    print("Error: Size must be positive")
+                    return
+            except ValueError:
+                print("Error: bytes must be an integer")
+                return
+
+        try:
+            # Resolve path
+            key = self.provider.resolve_path(self.current_prefix, path, is_directory=False)
+            
+            # Fetch range
+            content = self.provider.read_object_range(key, size)
+            
+            # Try decode as text
+            try:
+                text = content.decode('utf-8')
+                print(f"--- First {size} bytes of {key} ---")
+                print(text)
+                print("\n--- End of Peek ---")
+            except UnicodeDecodeError:
+                print(f"--- First {size} bytes of {key} (Hex Dump) ---")
+                # Simple hex dump
+                import binascii
+                print(binascii.hexlify(content).decode('ascii'))
+                print("\n--- End of Peek ---")
+                
+        except ClientError as e:
+             print(f"Error peeking object: {e}")
+        except Exception as e:
+             print(f"Error: {e}")
+
+    def do_audit(self, *args):
+        """Audit bucket permissions (ACLs, Policy, Public Access)."""
+        print("Audit not yet implemented in provider. (Placeholder)")
+
+    def do_cat(self, *args):
+        """Display the contents of a text-based object using the provider."""
+        if len(args) != 1:
+            print("Usage: cat <object_key>")
+            return
+        object_key_arg = args[0]
+        # Use provider to resolve path
+        object_key = self.provider.resolve_path(self.current_prefix, object_key_arg, is_directory=False)
+        if not object_key or object_key.endswith('/'):
+            print("Error: Invalid file path for cat.")
+            return
+            
+        # SAFETY CHECK: Check size before downloading
+        try:
+            meta = self.provider.get_object_metadata(object_key)
+            size = meta.get('size', 0)
+            human_size = self._human_readable_size(size)
+            
+            if size > 1024 * 1024: # > 1MB
+                print(f"Warning: File is large ({human_size}).")
+                choice = self._get_single_char_input("Display anyway? [y/N/p(eek)]: ")
+                print() # Newline
+                if choice == 'p':
+                    self.do_peek(object_key_arg)
+                    return
+                if choice != 'y':
+                    return
+        except Exception:
+             # If head_object fails (permissions?), warn but allow proceeding if user insists? 
+             # Or just fail. 
+             pass # Proceed to try get_object, maybe it works.
+
+        try:
+            # Use provider to get object content
+            content_bytes = self.provider.get_object(object_key)
+            content = content_bytes.decode('utf-8')
+            
+            # --- Use system pager via pydoc.pager ---
+            import pydoc
+            pydoc.pager(content)
+            
+        except ClientError as e:
+            # Catch S3 specific error for example, but should be general
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            if error_code == 'NoSuchKey':
+                 print(f"Error: Object not found: {object_key}")
+            else:
+                 print(f"Error accessing object: {error_code}")
+        except UnicodeDecodeError:
+            print("Error: Unable to decode the object as text (likely binary file). Try 'open' or 'peek'.")
+        except Exception as e:
+            print(f"Error during cat: {e}")
+
+    def do_open(self, *args):
+        """Download and open an object using the provider."""
+        if len(args) != 1:
+            print("Usage: open <object_key>")
+            return
+        object_key_arg = args[0]
+        # Use provider to resolve path
+        object_key = self.provider.resolve_path(self.current_prefix, object_key_arg, is_directory=False)
+        if not object_key or object_key.endswith('/'):
+            print("Error: Invalid file path for open.")
+            return
+        
+        temp_file = None
+        temp_path = None
+        try:
+            base_name = os.path.basename(object_key) or "downloaded_file"
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{base_name}")
+            temp_path = temp_file.name
+            temp_file.close() 
+
+            print(f"Downloading {object_key} to temporary file...")
+            # Use provider to download
+            self.provider.download_file(object_key, temp_path)
+            print(f"Opening {temp_path}...")
+
+            if platform.system() == 'Windows':
+                os.startfile(temp_path)
+            elif platform.system() == 'Darwin': 
+                subprocess.run(['open', temp_path], check=True)
+            else: 
+                subprocess.run(['xdg-open', temp_path], check=True)
+
+        except ClientError as e: # Example S3 error
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            print(f"Error accessing object: {error_code}")
+            if temp_path and os.path.exists(temp_path): os.unlink(temp_path) 
+        except FileNotFoundError:
+             print("Error: Could not find system command ('open' or 'xdg-open').")
+             if temp_path and os.path.exists(temp_path): os.unlink(temp_path) 
+        except subprocess.CalledProcessError as e:
+             print(f"Error opening file with system command: {e}")
+        except Exception as e:
+            print(f"Error during open: {e}")
+            if temp_path and os.path.exists(temp_path): os.unlink(temp_path) 
+
 # --- Argument Parsing and Client Creation --- 
 def create_s3_client(args):
-    # (Logic remains the same)
     if args.profile:
         session = boto3.Session(profile_name=args.profile)
         return session.client('s3')
@@ -1121,7 +1324,7 @@ def parse_args():
     # Add provider argument later if needed
     parser = argparse.ArgumentParser(description='BucketBoss - Interactive Cloud Storage Shell') # Rebranded
     # --- S3 Specific Args --- (Consider moving to provider-specific parsing)
-    parser.add_argument('--bucket', required=True, help='S3 bucket name')
+    parser.add_argument('--bucket', required=False, help='S3 bucket name (optional; omit to list all buckets)')
     group = parser.add_argument_group('S3 Authentication methods')
     group.add_argument('--profile', help='AWS CLI profile name for S3')
     group.add_argument('--access-key', help='AWS access key for S3')
@@ -1171,7 +1374,7 @@ def crawl_prefix_recursive(provider: CloudProvider, cache: dict, status_dict: di
     else:
         try:
             # print(f"[Crawl: Fetching prefix '{prefix or '<root>'}' at depth {current_depth}]", file=sys.stderr)
-            dirs, files = provider.list_objects(prefix)
+            dirs, files, _ = provider.list_objects(prefix)
             cache[prefix] = (dirs, files, time.time())
             status_dict["cached_prefixes"] = status_dict.get("cached_prefixes", 0) + 1
         except Exception as e:
@@ -1204,11 +1407,24 @@ def background_cache_crawl(provider: CloudProvider, cache: dict, status_dict: di
 # --- Main Execution --- 
 def main():
     args = parse_args()
-    provider = None
-    
-    # --- Provider Instantiation (Currently only S3) ---
+    # Create initial S3 client for both modes
     try:
         s3_client = create_s3_client(args)
+    except Exception as e:
+        print(f"Error creating S3 client: {e}", file=sys.stderr)
+        return
+
+    # Multi-bucket mode if no bucket provided
+    if not args.bucket:
+        provider = MultiBucketProvider(s3_client)
+        print("BucketBoss Multi-Bucket Shell. Type 'help' or 'exit'.")
+        app = BucketBossApp(provider)
+        app.run()
+        return
+    provider = None
+    
+    # --- Provider Instantiation (Single-bucket mode) ---
+    try:
         provider = S3Provider(args.bucket, s3_client)
         # Verify connection using provider method
         provider.head_bucket() 

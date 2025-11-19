@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bucketboss"
+version = "0.1.0"
+description = "Interactive Cloud Storage Shell for S3"
+readme = "readme.md"
+requires-python = ">=3.8"
+dependencies = [
+    "boto3",
+    "prompt_toolkit",
+]
+
+[project.scripts]
+bb = "bucketboss:main"
