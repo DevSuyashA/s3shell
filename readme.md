@@ -7,13 +7,13 @@ Interactive Cloud Storage Shell for S3
 Install with uv and git:
 
 ```bash
-uv add git+https://github.com/4nur44g/bucketboss.git
+uv add git+https://github.com/csek-comanage/bucketboss.git
 ```
 
 For development:
 
 ```bash
-uv add --editable git+https://github.com/4nur44g/bucketboss.git
+uv add --editable git+https://github.com/csek-comanage/bucketboss.git
 ```
 
 ## Usage
