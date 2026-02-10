@@ -277,6 +277,19 @@ def main():
     # Multi-bucket mode if no bucket provided
     if not args.bucket:
         provider = MultiBucketProvider(s3_client)
+        try:
+            provider.head_bucket()
+        except Exception:
+            print("Error: Cannot list buckets. Multi-bucket mode requires AWS credentials.")
+            print("")
+            print("  Options:")
+            print("    bb --profile <profile>              # use an AWS CLI profile")
+            print("    bb --access-key <key> --secret-key <secret>")
+            print("")
+            print("  For open/public buckets, specify the bucket directly:")
+            print("    bb --bucket <name>                  # via boto3 (unsigned)")
+            print("    bb --url https://bucket.s3.amazonaws.com/  # via HTTP/XML")
+            return
         print("BucketBoss Multi-Bucket Shell. Type 'help' or 'exit'.")
         app = BucketBossApp(provider)
         app.config = config
