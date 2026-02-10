@@ -169,28 +169,6 @@ def do_head(app, *args):
 # du — disk usage summary
 # ---------------------------------------------------------------------------
 
-def _sum_size_recursive(app, prefix, max_depth, current_depth=0):
-    """Recursively sum the total size of all files under prefix."""
-    total = 0
-    file_count = 0
-    dirs, files, _ = app.list_objects(prefix)
-
-    for f in files:
-        total += f.get('size', 0)
-        file_count += 1
-
-    if max_depth is None or current_depth < max_depth:
-        for d in dirs:
-            sub_prefix = prefix + d + '/'
-            sub_total, sub_count = _sum_size_recursive(
-                app, sub_prefix, max_depth, current_depth + 1
-            )
-            total += sub_total
-            file_count += sub_count
-
-    return total, file_count
-
-
 def do_du(app, *args):
     """Disk usage summary for remote directories.
 
@@ -198,6 +176,8 @@ def do_du(app, *args):
     Options:
       --depth N   Depth to report (default: 1, summarizes immediate children)
     """
+    from ..parallel import parallel_walk, get_workers_from_app
+
     arg_list = list(args)
     path = None
     depth = 1
@@ -232,6 +212,9 @@ def do_du(app, *args):
     print("📊 Disk usage: %s" % (prefix or '/'))
     print()
 
+    workers = get_workers_from_app(app)
+
+    # First list the current level to get immediate children
     dirs, files, _ = app.list_objects(prefix)
 
     entries = []  # (name, size)
@@ -241,15 +224,31 @@ def do_du(app, *args):
     if root_file_size > 0:
         entries.append(('.', root_file_size))
 
-    # Size of each subdirectory
-    for d in dirs:
-        sub_prefix = prefix + d + '/'
-        sys.stdout.write("\r   Scanning %s..." % d)
-        sys.stdout.flush()
-        sub_total, _ = _sum_size_recursive(app, sub_prefix, max_depth=None)
-        entries.append((d + '/', sub_total))
-
+    # Walk all subdirectories in parallel, then aggregate per top-level child
     if dirs:
+        sys.stdout.write("   Scanning...\r")
+        sys.stdout.flush()
+
+        # Collect all prefixes to walk in parallel
+        sub_prefixes = [(prefix + d + '/', d) for d in dirs]
+
+        # Walk each subdirectory — use parallel_walk for each
+        # Submit all subdirectory walks at once via parallel_walk on the parent
+        all_files, _, _ = parallel_walk(app, prefix, max_depth=50, workers=workers)
+
+        # Aggregate sizes per immediate child directory
+        dir_sizes = collections.Counter()
+        for full_key, f in all_files:
+            rel = full_key[len(prefix):] if full_key.startswith(prefix) else full_key
+            if '/' in rel:
+                top_dir = rel.split('/')[0] + '/'
+                dir_sizes[top_dir] += f.get('size', 0)
+            # Files at root level are already counted in root_file_size
+
+        for d in dirs:
+            dname = d + '/'
+            entries.append((dname, dir_sizes.get(dname, 0)))
+
         sys.stdout.write("\r" + " " * 60 + "\r")
         sys.stdout.flush()
 

@@ -144,16 +144,19 @@ def do_cd(app, *args):
 # tree — visual directory tree
 # ---------------------------------------------------------------------------
 
-def _tree_walk(app, prefix, max_depth, current_depth, line_prefix):
-    """Recursively build tree lines with box-drawing characters."""
+def _render_tree(prefix, dir_contents, max_depth, current_depth, line_prefix):
+    """Render tree lines from pre-collected dir_contents dict."""
     lines = []
-    dirs, files, _ = app.list_objects(prefix)
+    entry = dir_contents.get(prefix)
+    if entry is None:
+        return lines
 
+    child_dirs, child_files = entry
     entries = []
-    for d in dirs:
+    for d in child_dirs:
         entries.append((d + '/', True))
-    for f in files:
-        entries.append((f['name'], False))
+    for fname in child_files:
+        entries.append((fname, False))
 
     for idx, (name, is_dir) in enumerate(entries):
         is_last = (idx == len(entries) - 1)
@@ -163,8 +166,8 @@ def _tree_walk(app, prefix, max_depth, current_depth, line_prefix):
         if is_dir and current_depth < max_depth:
             extension = '    ' if is_last else '│   '
             sub_prefix = prefix + name
-            sub_lines = _tree_walk(
-                app, sub_prefix, max_depth, current_depth + 1,
+            sub_lines = _render_tree(
+                sub_prefix, dir_contents, max_depth, current_depth + 1,
                 line_prefix + extension,
             )
             lines.extend(sub_lines)
@@ -179,6 +182,8 @@ def do_tree(app, *args):
     Options:
       --depth N   Max depth to display (default: 3)
     """
+    from ..parallel import parallel_walk, get_workers_from_app
+
     arg_list = list(args)
     path = None
     depth = 3
@@ -212,7 +217,58 @@ def do_tree(app, *args):
     root_label = app.provider.get_prompt_prefix() + prefix
     print(root_label)
 
-    tree_lines = _tree_walk(app, prefix, depth, 0, '')
+    workers = get_workers_from_app(app)
+
+    # Collect all data in parallel
+    all_files, all_dirs, _ = parallel_walk(app, prefix, max_depth=depth, workers=workers)
+
+    # Build a dir_contents dict: prefix -> (child_dir_names, child_file_names)
+    # We need to reconstruct the parent→children mapping
+    from collections import defaultdict
+    dir_contents = defaultdict(lambda: ([], []))
+
+    # Track which directories exist at each prefix
+    dir_children = defaultdict(list)   # parent_prefix -> [dir_name, ...]
+    file_children = defaultdict(list)  # parent_prefix -> [file_name, ...]
+
+    for full_dir, _depth in all_dirs:
+        # full_dir looks like "prefix/subdir/" — parent is everything before the last component
+        parent = full_dir.rstrip('/')
+        if '/' in parent:
+            parent_prefix = parent.rsplit('/', 1)[0] + '/'
+            dir_name = parent.rsplit('/', 1)[1]
+        else:
+            parent_prefix = ''
+            dir_name = parent
+        # Handle case where prefix itself is the parent
+        if not full_dir.startswith(prefix):
+            continue
+        rel = full_dir[len(prefix):]
+        parts = rel.rstrip('/').split('/')
+        if len(parts) == 1:
+            dir_children[prefix].append(parts[0])
+        else:
+            immediate_parent = prefix + '/'.join(parts[:-1]) + '/'
+            dir_children[immediate_parent].append(parts[-1])
+
+    for full_key, f in all_files:
+        if not full_key.startswith(prefix):
+            continue
+        rel = full_key[len(prefix):]
+        if '/' in rel:
+            parent_prefix = prefix + rel.rsplit('/', 1)[0] + '/'
+        else:
+            parent_prefix = prefix
+        file_children[parent_prefix].append(f['name'])
+
+    # Build the dir_contents mapping
+    all_prefixes = set(dir_children.keys()) | set(file_children.keys())
+    all_prefixes.add(prefix)
+    dir_contents_map = {}
+    for p in all_prefixes:
+        dir_contents_map[p] = (dir_children.get(p, []), file_children.get(p, []))
+
+    tree_lines = _render_tree(prefix, dir_contents_map, depth, 0, '')
     for line in tree_lines:
         print(line)
     print()

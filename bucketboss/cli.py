@@ -9,6 +9,7 @@ import botocore.client
 from botocore.exceptions import ClientError
 
 from .app import BucketBossApp
+from .config import load_config, get_workers
 from .providers.base import CloudProvider
 from .providers.s3 import S3Provider, MultiBucketProvider
 from .providers.s3xml import S3XMLProvider, parse_s3_url
@@ -36,6 +37,7 @@ def parse_args():
     parser.add_argument('--bucket', required=False, help='S3 bucket name (optional; omit to list all buckets)')
     parser.add_argument('--url', help='S3 HTTP URL for SDK-free XML access (e.g. https://bucket.s3.us-west-2.amazonaws.com/)')
     parser.add_argument('--provider', choices=['s3', 's3xml'], default='s3', help='Provider backend (default: s3)')
+    parser.add_argument('--config', dest='config_path', default=None, help='Path to config file (default: ~/.bucketboss/config.json)')
     group = parser.add_argument_group('S3 Authentication methods')
     group.add_argument('--profile', help='AWS CLI profile name for S3')
     group.add_argument('--access-key', help='AWS access key for S3')
@@ -93,14 +95,55 @@ def crawl_prefix_recursive(provider, cache, status_dict, prefix, current_depth, 
             crawl_prefix_recursive(provider, cache, status_dict, next_prefix, current_depth + 1, max_depth)
 
 
-def background_cache_crawl(provider, cache, status_dict, max_depth):
-    """Target function for background thread to crawl and cache."""
+def background_cache_crawl(provider, cache, status_dict, max_depth, workers=16):
+    """Target function for background thread to crawl and cache using parallel BFS."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from .app import CACHE_TTL_SECONDS
+
     status_dict["status"] = "loading"
     status_dict["depth"] = 0
     status_dict["cached_prefixes"] = 0
     try:
-        print(f"[Background crawl started: Max Depth {max_depth}]", file=sys.stderr)
-        crawl_prefix_recursive(provider, cache, status_dict, '', 1, max_depth)
+        print(f"[Background crawl started: Max Depth {max_depth}, Workers {workers}]", file=sys.stderr)
+
+        current_level = [('', 1)]  # (prefix, depth)
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            while current_level:
+                next_level = []
+                future_to_prefix = {}
+
+                for prefix, depth in current_level:
+                    entry = cache.get(prefix)
+                    if entry and time.time() - entry[2] < CACHE_TTL_SECONDS:
+                        # Already cached — still need to queue subdirs
+                        dirs = entry[0]
+                        status_dict["depth"] = max(status_dict.get("depth", 0), depth)
+                        if depth < max_depth:
+                            for d in dirs:
+                                if d:
+                                    next_level.append((prefix + d + '/', depth + 1))
+                    else:
+                        future = executor.submit(provider.list_objects, prefix)
+                        future_to_prefix[future] = (prefix, depth)
+
+                for future in as_completed(future_to_prefix):
+                    prefix, depth = future_to_prefix[future]
+                    try:
+                        dirs, files, _ = future.result()
+                        cache[prefix] = (dirs, files, time.time())
+                        status_dict["cached_prefixes"] = status_dict.get("cached_prefixes", 0) + 1
+                        status_dict["depth"] = max(status_dict.get("depth", 0), depth)
+
+                        if depth < max_depth:
+                            for d in dirs:
+                                if d:
+                                    next_level.append((prefix + d + '/', depth + 1))
+                    except Exception as e:
+                        print(f"[Crawl: Error listing prefix '{prefix or '<root>'}': {e}]", file=sys.stderr)
+
+                current_level = next_level
+
         status_dict["status"] = "complete"
         print(
             f"[Background crawl finished. Max Depth: {status_dict['depth']}, "
@@ -181,6 +224,8 @@ def _print_banner(provider, perms):
 
 def main():
     args = parse_args()
+    config = load_config(getattr(args, 'config_path', None))
+    workers = get_workers(config)
 
     # Handle --url / --provider s3xml mode (no SDK required)
     if args.url or args.provider == 's3xml':
@@ -196,6 +241,7 @@ def main():
             _print_banner(provider, perms)
 
             app = BucketBossApp(provider)
+            app.config = config
 
             stats_thread = threading.Thread(
                 target=collect_stats_background,
@@ -203,6 +249,15 @@ def main():
                 daemon=True,
             )
             stats_thread.start()
+
+            crawl_depth = config.get("general", {}).get("crawl_depth", 2)
+            if crawl_depth > 0:
+                crawl_thread = threading.Thread(
+                    target=background_cache_crawl,
+                    args=(provider, app.cache, app.crawl_status, crawl_depth, workers),
+                    daemon=True,
+                )
+                crawl_thread.start()
 
             app.run()
         except (PermissionError, FileNotFoundError, ConnectionError) as e:
@@ -224,6 +279,7 @@ def main():
         provider = MultiBucketProvider(s3_client)
         print("BucketBoss Multi-Bucket Shell. Type 'help' or 'exit'.")
         app = BucketBossApp(provider)
+        app.config = config
         app.run()
         return
 
@@ -237,6 +293,7 @@ def main():
         _print_banner(provider, perms)
 
         app = BucketBossApp(provider)
+        app.config = config
 
         stats_thread = threading.Thread(
             target=collect_stats_background,
@@ -245,11 +302,11 @@ def main():
         )
         stats_thread.start()
 
-        crawl_depth = 2
+        crawl_depth = config.get("general", {}).get("crawl_depth", 2)
         if crawl_depth > 0:
             crawl_thread = threading.Thread(
                 target=background_cache_crawl,
-                args=(provider, app.cache, app.crawl_status, crawl_depth),
+                args=(provider, app.cache, app.crawl_status, crawl_depth, workers),
                 daemon=True,
             )
             crawl_thread.start()

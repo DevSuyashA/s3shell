@@ -127,25 +127,22 @@ def _parse_enum_args(args):
 
 def _recursive_list(app, prefix, max_depth, current_depth=0):
     """Recursively list all objects under prefix up to max_depth.
+    Uses parallel_walk for concurrent directory traversal.
     Returns (all_files, all_dirs_seen) where all_files is list of
     (full_key, file_info) and all_dirs_seen is list of (dir_name, full_prefix).
     """
-    all_files = []
+    from ..parallel import parallel_walk, get_workers_from_app
+
+    workers = get_workers_from_app(app)
+    all_files, all_dirs_raw, _ = parallel_walk(
+        app, prefix, max_depth=max_depth, workers=workers,
+    )
+
+    # Convert all_dirs from (full_prefix, depth) to (dir_name, full_prefix)
     all_dirs = []
-
-    dirs, files, _ = app.list_objects(prefix)
-
-    for f in files:
-        full_key = prefix + f['name']
-        all_files.append((full_key, f))
-
-    if current_depth < max_depth:
-        for d in dirs:
-            dir_prefix = prefix + d + '/'
-            all_dirs.append((d, dir_prefix))
-            sub_files, sub_dirs = _recursive_list(app, dir_prefix, max_depth, current_depth + 1)
-            all_files.extend(sub_files)
-            all_dirs.extend(sub_dirs)
+    for full_prefix, depth in all_dirs_raw:
+        dir_name = full_prefix.rstrip('/').rsplit('/', 1)[-1]
+        all_dirs.append((dir_name, full_prefix))
 
     return all_files, all_dirs
 
@@ -723,6 +720,8 @@ def do_th(app, *args):
 
 def do_scope(app, *args):
     """Scan the bucket/prefix and show a scope summary."""
+    from ..parallel import parallel_walk, get_workers_from_app
+
     arg_list = list(args)
     path = ''
     if arg_list and not arg_list[0].startswith('-'):
@@ -736,8 +735,22 @@ def do_scope(app, *args):
     print("")
     print("🔭 Scanning bucket...")
 
-    total_objects = 0
-    total_size = 0
+    workers = get_workers_from_app(app)
+
+    def _progress(nfiles, ndirs, sz):
+        if nfiles % 100 == 0:
+            sys.stdout.write("\r   Scanned: {:,} objects...".format(nfiles))
+            sys.stdout.flush()
+
+    all_files, all_dirs, total_size = parallel_walk(
+        app, prefix, max_depth=50, workers=workers, progress_callback=_progress,
+    )
+
+    # Clear progress line
+    sys.stdout.write("\r" + " " * 60 + "\r")
+    sys.stdout.flush()
+
+    total_objects = len(all_files)
     ext_counter = Counter()
     prefix_counter = Counter()
     deepest_path = ''
@@ -747,62 +760,37 @@ def do_scope(app, *args):
     newest_date = None
     newest_key = ''
 
-    def _walk(pfx, depth):
-        nonlocal total_objects, total_size, deepest_path, deepest_depth
-        nonlocal oldest_date, oldest_key, newest_date, newest_key
+    for full_key, f in all_files:
+        ext = f.get('extension', '')
+        if ext:
+            ext_counter[ext] += 1
+        else:
+            ext_counter['(none)'] += 1
 
-        dirs, files, _ = app.list_objects(pfx)
+        # Track top-level prefix
+        if '/' in full_key:
+            top_prefix = full_key.split('/')[0] + '/'
+            prefix_counter[top_prefix] += 1
+        else:
+            prefix_counter['(root)'] += 1
 
-        for f in files:
-            total_objects += 1
-            total_size += f.get('size', 0)
+        # Track depth
+        key_depth = full_key.count('/')
+        if key_depth > deepest_depth:
+            deepest_depth = key_depth
+            parent = full_key.rsplit('/', 1)[0] + '/' if '/' in full_key else '(root)'
+            deepest_path = parent
 
-            ext = f.get('extension', '')
-            if ext:
-                ext_counter[ext] += 1
-            else:
-                ext_counter['(none)'] += 1
-
-            full_key = pfx + f['name']
-
-            # Track top-level prefix
-            if pfx:
-                top_prefix = pfx.split('/')[0] + '/'
-                prefix_counter[top_prefix] += 1
-            else:
-                prefix_counter['(root)'] += 1
-
-            # Track depth
-            key_depth = full_key.count('/')
-            if key_depth > deepest_depth:
-                deepest_depth = key_depth
-                parent = full_key.rsplit('/', 1)[0] + '/' if '/' in full_key else '(root)'
-                deepest_path = parent
-
-            # Track dates
-            lm = f.get('last_modified')
-            if lm:
-                if isinstance(lm, datetime):
-                    if oldest_date is None or lm < oldest_date:
-                        oldest_date = lm
-                        oldest_key = full_key
-                    if newest_date is None or lm > newest_date:
-                        newest_date = lm
-                        newest_key = full_key
-
-            if total_objects % 100 == 0:
-                sys.stdout.write("\r   Scanned: {:,} objects...".format(total_objects))
-                sys.stdout.flush()
-
-        for d in dirs:
-            sub_prefix = pfx + d + '/'
-            _walk(sub_prefix, depth + 1)
-
-    _walk(prefix, 0)
-
-    # Clear progress line
-    sys.stdout.write("\r" + " " * 60 + "\r")
-    sys.stdout.flush()
+        # Track dates
+        lm = f.get('last_modified')
+        if lm:
+            if isinstance(lm, datetime):
+                if oldest_date is None or lm < oldest_date:
+                    oldest_date = lm
+                    oldest_key = full_key
+                if newest_date is None or lm > newest_date:
+                    newest_date = lm
+                    newest_key = full_key
 
     # Print results
     print("📊 Scope Results:")

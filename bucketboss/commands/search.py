@@ -7,20 +7,14 @@ from ..formatting import human_readable_size
 
 def _recursive_walk(app, prefix, max_depth, current_depth=0):
     """Recursively list all files under prefix up to max_depth.
-    Yields (full_key, file_info) tuples.
+    Uses parallel_walk for concurrent directory traversal.
+    Returns a list of (full_key, file_info) tuples.
     """
-    dirs, files, _ = app.list_objects(prefix)
+    from ..parallel import parallel_walk, get_workers_from_app
 
-    for f in files:
-        full_key = prefix + f['name']
-        yield full_key, f
-
-    if current_depth >= max_depth:
-        return
-
-    for d in dirs:
-        sub_prefix = prefix + d + '/'
-        yield from _recursive_walk(app, sub_prefix, max_depth, current_depth + 1)
+    workers = get_workers_from_app(app)
+    all_files, _, _ = parallel_walk(app, prefix, max_depth=max_depth, workers=workers)
+    return all_files
 
 
 def _format_date(f):
