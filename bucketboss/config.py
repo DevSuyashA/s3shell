@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 
@@ -16,9 +17,7 @@ def load_config(config_path=None):
     if config_path is None:
         config_path = os.path.join(os.path.expanduser("~"), ".bucketboss", "config.json")
 
-    config = DEFAULT_CONFIG.copy()
-    # Deep copy general
-    config["general"] = DEFAULT_CONFIG["general"].copy()
+    config = copy.deepcopy(DEFAULT_CONFIG)
 
     if os.path.exists(config_path):
         try:

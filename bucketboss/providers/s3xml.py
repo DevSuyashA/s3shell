@@ -184,8 +184,8 @@ class S3XMLProvider(CloudProvider):
 
         url = f"{self.base_url}?{urlencode(params)}"
         req = urllib.request.Request(url, method='GET')
-        resp = urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT)
-        body = resp.read()
+        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:
+            body = resp.read()
         return self._parse_list_response(body, prefix, v2=True)
 
     def _list_objects_v1(
@@ -202,8 +202,8 @@ class S3XMLProvider(CloudProvider):
 
         url = f"{self.base_url}?{urlencode(params)}"
         req = urllib.request.Request(url, method='GET')
-        resp = urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT)
-        body = resp.read()
+        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:
+            body = resp.read()
         return self._parse_list_response(body, prefix, v2=False)
 
     def _parse_list_response(
@@ -317,8 +317,8 @@ class S3XMLProvider(CloudProvider):
         url = f"{self.base_url}/{quote(key, safe='/')}"
         try:
             req = urllib.request.Request(url, method='GET')
-            resp = urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT)
-            return resp.read()
+            with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:
+                return resp.read()
         except urllib.error.HTTPError as e:
             self._handle_http_error(e, f"getting object '{key}'")
             raise
@@ -330,13 +330,13 @@ class S3XMLProvider(CloudProvider):
         url = f"{self.base_url}/{quote(key, safe='/')}"
         try:
             req = urllib.request.Request(url, method='GET')
-            resp = urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT)
-            with open(local_path, 'wb') as f:
-                while True:
-                    chunk = resp.read(8192)
-                    if not chunk:
-                        break
-                    f.write(chunk)
+            with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:
+                with open(local_path, 'wb') as f:
+                    while True:
+                        chunk = resp.read(8192)
+                        if not chunk:
+                            break
+                        f.write(chunk)
         except urllib.error.HTTPError as e:
             self._handle_http_error(e, f"downloading '{key}'")
             raise
@@ -354,8 +354,8 @@ class S3XMLProvider(CloudProvider):
         try:
             req = urllib.request.Request(url, method='GET')
             req.add_header('Range', f'bytes=0-{size - 1}')
-            resp = urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT)
-            return resp.read()
+            with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:
+                return resp.read()
         except urllib.error.HTTPError as e:
             self._handle_http_error(e, f"reading range of '{key}'")
             raise
@@ -367,8 +367,8 @@ class S3XMLProvider(CloudProvider):
         url = f"{self.base_url}/{quote(key, safe='/')}"
         try:
             req = urllib.request.Request(url, method='HEAD')
-            resp = urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT)
-            headers = resp.headers
+            with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:
+                headers = resp.headers
 
             size = int(headers.get('Content-Length', 0))
             content_type = headers.get('Content-Type', 'application/octet-stream')

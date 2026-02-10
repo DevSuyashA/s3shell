@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import shlex
@@ -130,14 +131,18 @@ class BucketBossApp:
         """Gets a single character input from the terminal without requiring Enter."""
         sys.stdout.write(prompt_message)
         sys.stdout.flush()
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
         try:
-            tty.setraw(sys.stdin.fileno())
-            char = sys.stdin.read(1)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        return char.lower()
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                char = sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            return char.lower()
+        except (termios.error, io.UnsupportedOperation, AttributeError):
+            # Not a TTY (piped input) — default to 'q' to skip/quit
+            return 'q'
 
     def _get_cache_file_path(self):
         """Constructs the path for the cache file."""

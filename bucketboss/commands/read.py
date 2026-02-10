@@ -113,6 +113,7 @@ def do_open(app, *args):
 
     temp_file = None
     temp_path = None
+    opened_successfully = False
     try:
         base_name = os.path.basename(object_key) or "downloaded_file"
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{base_name}")
@@ -130,18 +131,17 @@ def do_open(app, *args):
         else:
             subprocess.run(['xdg-open', temp_path], check=True)
 
+        opened_successfully = True
+
     except ClientError as e:
         error_code = e.response.get('Error', {}).get('Code', 'Unknown')
         print(f"Error accessing object: {error_code}")
-        if temp_path and os.path.exists(temp_path):
-            os.unlink(temp_path)
     except FileNotFoundError:
         print("Error: Could not find system command ('open' or 'xdg-open').")
-        if temp_path and os.path.exists(temp_path):
-            os.unlink(temp_path)
     except subprocess.CalledProcessError as e:
         print(f"Error opening file with system command: {e}")
     except Exception as e:
         print(f"Error during open: {e}")
-        if temp_path and os.path.exists(temp_path):
+    finally:
+        if not opened_successfully and temp_path and os.path.exists(temp_path):
             os.unlink(temp_path)

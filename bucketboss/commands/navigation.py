@@ -102,7 +102,8 @@ def do_cd(app, *args):
             app.current_prefix = potential_new_prefix
             return
 
-        target_dir_name = path_arg.split('/')[-1] or path_arg.split('/')[-2]
+        parts = [p for p in path_arg.split('/') if p]
+        target_dir_name = parts[-1] if parts else ''
         if not target_dir_name or target_dir_name == '.':
             target_dir_name = potential_new_prefix.rstrip('/').split('/')[-1]
 
