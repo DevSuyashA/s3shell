@@ -5,7 +5,10 @@ from prompt_toolkit.completion import Completer, Completion
 
 
 class BucketBossCompleter(Completer):
-    remote_path_commands = {'ls', 'cd', 'cat', 'open', 'get'}
+    remote_path_commands = {
+        'ls', 'cd', 'cat', 'open', 'get', 'peek', 'head', 'info',
+        'tag', 'th', 'diff', 'find', 'mirror', 'enum', 'du', 'tree',
+    }
 
     def __init__(self, bucket_boss_app):
         self.app = bucket_boss_app
