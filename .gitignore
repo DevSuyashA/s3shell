@@ -1,3 +1,6 @@
 Todo.md
 .aider*
 .cr.md
+__pycache__/
+**/__pycache__/
+bb-report-*

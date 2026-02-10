@@ -1,4 +1,6 @@
 import collections
+import os
+from datetime import datetime
 
 from ..formatting import human_readable_size
 
@@ -81,3 +83,82 @@ def do_crawl_status(app, *args):
 def do_audit(app, *args):
     """Audit bucket permissions (ACLs, Policy, Public Access)."""
     print("Audit not yet implemented in provider. (Placeholder)")
+
+
+def do_pwd(app, *args):
+    """Print the full current remote path."""
+    print(app.provider.get_prompt_prefix() + app.current_prefix)
+
+
+def do_info(app, *args):
+    """Show full metadata for a file."""
+    if not args:
+        print("Usage: info <file>")
+        return
+
+    target = args[0]
+    key = app.provider.resolve_path(app.current_prefix, target, is_directory=False)
+
+    try:
+        meta = app.provider.get_object_metadata(key)
+    except Exception as e:
+        print("Error: %s" % e)
+        return
+
+    size = meta.get('size', 0)
+    last_modified = meta.get('last_modified')
+    content_type = meta.get('content_type', 'unknown')
+
+    if isinstance(last_modified, datetime):
+        date_str = last_modified.strftime('%Y-%m-%d %H:%M:%S %Z')
+    elif last_modified:
+        date_str = str(last_modified)
+    else:
+        date_str = 'unknown'
+
+    print("")
+    print("📄 %s" % key)
+    print("   Size:          %s (%s bytes)" % (human_readable_size(size), "{:,}".format(size)))
+    print("   Last modified: %s" % date_str)
+    print("   Content-Type:  %s" % content_type)
+    print("   Full key:      %s" % key)
+    print("")
+
+
+def do_head(app, *args):
+    """Show first N lines of a file."""
+    if not args:
+        print("Usage: head <file> [lines]")
+        return
+
+    target = args[0]
+    num_lines = 10
+    if len(args) > 1:
+        try:
+            num_lines = int(args[1])
+        except ValueError:
+            print("Invalid line count: %s" % args[1])
+            return
+
+    key = app.provider.resolve_path(app.current_prefix, target, is_directory=False)
+
+    try:
+        # Read first ~64KB to get the head lines
+        data = app.provider.read_object_range(key, 65536)
+    except Exception:
+        # Fall back to full object download if range requests fail
+        try:
+            data = app.provider.get_object(key)
+        except Exception as e:
+            print("Error: %s" % e)
+            return
+
+    try:
+        text = data.decode('utf-8')
+    except UnicodeDecodeError:
+        print("⚠ Binary file detected. Use 'peek %s' instead." % target)
+        return
+
+    lines = text.split('\n')
+    for line in lines[:num_lines]:
+        print(line)

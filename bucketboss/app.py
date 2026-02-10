@@ -18,7 +18,9 @@ from .providers.base import CloudProvider
 from .commands.navigation import do_ls, do_cd
 from .commands.read import do_cat, do_peek, do_open
 from .commands.transfer import do_get, do_put
-from .commands.info import do_stats, do_crawl_status, do_audit
+from .commands.info import do_stats, do_crawl_status, do_audit, do_pwd, do_info, do_head
+from .commands.recon import do_enum, do_enum_report, do_th, do_scope
+from .commands.findings import do_tag, do_findings, do_export
 from .commands.shell import do_exit, do_clear, do_help
 
 # Cache time-to-live in seconds (default 6 hours)
@@ -55,8 +57,21 @@ class BucketBossApp:
             'get': lambda *args: do_get(self, *args),
             'peek': lambda *args: do_peek(self, *args),
             'audit': lambda *args: do_audit(self, *args),
+            'enum': lambda *args: do_enum(self, *args),
+            'enum_report': lambda *args: do_enum_report(self, *args),
+            'th': lambda *args: do_th(self, *args),
+            'scope': lambda *args: do_scope(self, *args),
+            'pwd': lambda *args: do_pwd(self, *args),
+            'info': lambda *args: do_info(self, *args),
+            'head': lambda *args: do_head(self, *args),
+            'tag': lambda *args: do_tag(self, *args),
+            'findings': lambda *args: do_findings(self, *args),
+            'export': lambda *args: do_export(self, *args),
         }
         self.stats_result = {"status": "pending"}
+        self.last_enum_results = None
+        self.last_th_results = None
+        self.findings = []
         self.crawl_status = {"status": "pending", "depth": 0, "cached_prefixes": 0}
 
     def get_prompt(self):

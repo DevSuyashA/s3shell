@@ -11,6 +11,7 @@ from botocore.exceptions import ClientError
 from .app import BucketBossApp
 from .providers.base import CloudProvider
 from .providers.s3 import S3Provider, MultiBucketProvider
+from .providers.s3xml import S3XMLProvider, parse_s3_url
 
 
 def create_s3_client(args):
@@ -33,6 +34,8 @@ def create_s3_client(args):
 def parse_args():
     parser = argparse.ArgumentParser(description='BucketBoss - Interactive Cloud Storage Shell')
     parser.add_argument('--bucket', required=False, help='S3 bucket name (optional; omit to list all buckets)')
+    parser.add_argument('--url', help='S3 HTTP URL for SDK-free XML access (e.g. https://bucket.s3.us-west-2.amazonaws.com/)')
+    parser.add_argument('--provider', choices=['s3', 's3xml'], default='s3', help='Provider backend (default: s3)')
     group = parser.add_argument_group('S3 Authentication methods')
     group.add_argument('--profile', help='AWS CLI profile name for S3')
     group.add_argument('--access-key', help='AWS access key for S3')
@@ -110,8 +113,106 @@ def background_cache_crawl(provider, cache, status_dict, max_depth):
         print(f"[Background crawl failed: {e}]", file=sys.stderr)
 
 
+def probe_permissions(provider):
+    """Probe what permissions we have on the bucket."""
+    perms = {"list": False, "read": False, "stats": False}
+
+    # Probe list
+    first_file_key = None
+    try:
+        dirs, files, _ = provider.list_objects('', limit=1)
+        perms["list"] = True
+        if files:
+            first_file_key = files[0]['name']
+        elif dirs:
+            # Try listing inside the first directory to find a file
+            try:
+                _, sub_files, _ = provider.list_objects(dirs[0] + '/', limit=1)
+                if sub_files:
+                    first_file_key = dirs[0] + '/' + sub_files[0]['name']
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Probe read
+    if first_file_key:
+        try:
+            provider.get_object_metadata(first_file_key)
+            perms["read"] = True
+        except Exception:
+            pass
+
+    # Probe stats
+    try:
+        provider.get_bucket_stats()
+        perms["stats"] = True
+    except Exception:
+        pass
+
+    return perms
+
+
+def _print_banner(provider, perms):
+    """Print the startup banner."""
+    bucket_name = getattr(provider, 'bucket_name', 'unknown')
+
+    # Determine transport
+    from .providers.s3xml import S3XMLProvider
+    from .providers.s3 import S3Provider
+    if isinstance(provider, S3XMLProvider):
+        transport = "HTTP/XML (unsigned)"
+    elif isinstance(provider, S3Provider):
+        transport = "boto3"
+    else:
+        transport = "unknown"
+
+    list_icon = '✅' if perms['list'] else '❌'
+    read_icon = '✅' if perms['read'] else '❌'
+    stats_icon = '✅' if perms['stats'] else '❌'
+
+    print("")
+    print("🪣 BucketBoss v0.1.0")
+    print("   Target:    s3://%s/" % bucket_name)
+    print("   Transport: %s" % transport)
+    print("   Access:    %s List  %s Read  %s Stats" % (list_icon, read_icon, stats_icon))
+    print("")
+
+
 def main():
     args = parse_args()
+
+    # Handle --url / --provider s3xml mode (no SDK required)
+    if args.url or args.provider == 's3xml':
+        if not args.url:
+            print("Error: --url is required when using --provider s3xml", file=sys.stderr)
+            return
+        try:
+            base_url, bucket_name = parse_s3_url(args.url)
+            provider = S3XMLProvider(base_url, bucket_name)
+            provider.head_bucket()
+
+            perms = probe_permissions(provider)
+            _print_banner(provider, perms)
+
+            app = BucketBossApp(provider)
+
+            stats_thread = threading.Thread(
+                target=collect_stats_background,
+                args=(provider, app.stats_result),
+                daemon=True,
+            )
+            stats_thread.start()
+
+            app.run()
+        except (PermissionError, FileNotFoundError, ConnectionError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+        except ValueError as e:
+            print(f"Error parsing URL: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error connecting via HTTP: {e}", file=sys.stderr)
+        return
+
     try:
         s3_client = create_s3_client(args)
     except Exception as e:
@@ -131,12 +232,12 @@ def main():
     try:
         provider = S3Provider(args.bucket, s3_client)
         provider.head_bucket()
-        print(f"Successfully connected to S3 bucket: {args.bucket}")
+
+        perms = probe_permissions(provider)
+        _print_banner(provider, perms)
 
         app = BucketBossApp(provider)
 
-        # Start background stats collection
-        print("Initiating background stats collection...")
         stats_thread = threading.Thread(
             target=collect_stats_background,
             args=(provider, app.stats_result),
@@ -144,10 +245,8 @@ def main():
         )
         stats_thread.start()
 
-        # Start background cache crawl
         crawl_depth = 2
         if crawl_depth > 0:
-            print(f"Initiating background cache crawl (max depth {crawl_depth})...")
             crawl_thread = threading.Thread(
                 target=background_cache_crawl,
                 args=(provider, app.cache, app.crawl_status, crawl_depth),
