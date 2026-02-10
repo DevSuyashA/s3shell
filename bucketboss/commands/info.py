@@ -1,5 +1,6 @@
 import collections
 import os
+import sys
 from datetime import datetime
 
 from ..formatting import human_readable_size
@@ -162,3 +163,103 @@ def do_head(app, *args):
     lines = text.split('\n')
     for line in lines[:num_lines]:
         print(line)
+
+
+# ---------------------------------------------------------------------------
+# du — disk usage summary
+# ---------------------------------------------------------------------------
+
+def _sum_size_recursive(app, prefix, max_depth, current_depth=0):
+    """Recursively sum the total size of all files under prefix."""
+    total = 0
+    file_count = 0
+    dirs, files, _ = app.list_objects(prefix)
+
+    for f in files:
+        total += f.get('size', 0)
+        file_count += 1
+
+    if max_depth is None or current_depth < max_depth:
+        for d in dirs:
+            sub_prefix = prefix + d + '/'
+            sub_total, sub_count = _sum_size_recursive(
+                app, sub_prefix, max_depth, current_depth + 1
+            )
+            total += sub_total
+            file_count += sub_count
+
+    return total, file_count
+
+
+def do_du(app, *args):
+    """Disk usage summary for remote directories.
+
+    Usage: du [path] [--depth N]
+    Options:
+      --depth N   Depth to report (default: 1, summarizes immediate children)
+    """
+    arg_list = list(args)
+    path = None
+    depth = 1
+
+    i = 0
+    while i < len(arg_list):
+        arg = arg_list[i]
+        if arg == '--depth' and i + 1 < len(arg_list):
+            try:
+                depth = int(arg_list[i + 1])
+            except ValueError:
+                print("Invalid depth: " + arg_list[i + 1])
+                return
+            i += 2
+        elif arg == '--help':
+            print("Usage: du [path] [--depth N]")
+            return
+        elif not arg.startswith('-') and path is None:
+            path = arg
+            i += 1
+        else:
+            print("Unknown option: " + arg)
+            return
+
+    # Resolve prefix
+    if path:
+        prefix = app.provider.resolve_path(app.current_prefix, path, is_directory=True)
+    else:
+        prefix = app.current_prefix
+
+    print()
+    print("📊 Disk usage: %s" % (prefix or '/'))
+    print()
+
+    dirs, files, _ = app.list_objects(prefix)
+
+    entries = []  # (name, size)
+
+    # Size of files at the current level (not in subdirectories)
+    root_file_size = sum(f.get('size', 0) for f in files)
+    if root_file_size > 0:
+        entries.append(('.', root_file_size))
+
+    # Size of each subdirectory
+    for d in dirs:
+        sub_prefix = prefix + d + '/'
+        sys.stdout.write("\r   Scanning %s..." % d)
+        sys.stdout.flush()
+        sub_total, _ = _sum_size_recursive(app, sub_prefix, max_depth=None)
+        entries.append((d + '/', sub_total))
+
+    if dirs:
+        sys.stdout.write("\r" + " " * 60 + "\r")
+        sys.stdout.flush()
+
+    # Sort by size descending
+    entries.sort(key=lambda x: x[1], reverse=True)
+
+    total = sum(size for _, size in entries)
+
+    for name, size in entries:
+        print("  %9s  %s" % (human_readable_size(size), name))
+
+    print("  %9s  total" % human_readable_size(total))
+    print()

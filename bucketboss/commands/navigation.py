@@ -138,3 +138,81 @@ def do_cd(app, *args):
 
     except Exception as e:
         print(f"Error changing directory: {e}")
+
+
+# ---------------------------------------------------------------------------
+# tree — visual directory tree
+# ---------------------------------------------------------------------------
+
+def _tree_walk(app, prefix, max_depth, current_depth, line_prefix):
+    """Recursively build tree lines with box-drawing characters."""
+    lines = []
+    dirs, files, _ = app.list_objects(prefix)
+
+    entries = []
+    for d in dirs:
+        entries.append((d + '/', True))
+    for f in files:
+        entries.append((f['name'], False))
+
+    for idx, (name, is_dir) in enumerate(entries):
+        is_last = (idx == len(entries) - 1)
+        connector = '└── ' if is_last else '├── '
+        lines.append(line_prefix + connector + name)
+
+        if is_dir and current_depth < max_depth:
+            extension = '    ' if is_last else '│   '
+            sub_prefix = prefix + name
+            sub_lines = _tree_walk(
+                app, sub_prefix, max_depth, current_depth + 1,
+                line_prefix + extension,
+            )
+            lines.extend(sub_lines)
+
+    return lines
+
+
+def do_tree(app, *args):
+    """Display a visual directory tree.
+
+    Usage: tree [path] [--depth N]
+    Options:
+      --depth N   Max depth to display (default: 3)
+    """
+    arg_list = list(args)
+    path = None
+    depth = 3
+
+    i = 0
+    while i < len(arg_list):
+        arg = arg_list[i]
+        if arg == '--depth' and i + 1 < len(arg_list):
+            try:
+                depth = int(arg_list[i + 1])
+            except ValueError:
+                print("Invalid depth: " + arg_list[i + 1])
+                return
+            i += 2
+        elif arg == '--help':
+            print("Usage: tree [path] [--depth N]")
+            return
+        elif not arg.startswith('-') and path is None:
+            path = arg
+            i += 1
+        else:
+            print("Unknown option: " + arg)
+            return
+
+    # Resolve prefix
+    if path:
+        prefix = app.provider.resolve_path(app.current_prefix, path, is_directory=True)
+    else:
+        prefix = app.current_prefix
+
+    root_label = app.provider.get_prompt_prefix() + prefix
+    print(root_label)
+
+    tree_lines = _tree_walk(app, prefix, depth, 0, '')
+    for line in tree_lines:
+        print(line)
+    print()

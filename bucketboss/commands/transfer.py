@@ -1,7 +1,15 @@
+import difflib
 import fnmatch
+import hashlib
 import os
+import re
+import shutil
+import sys
+import tempfile
 
 from botocore.exceptions import ClientError
+
+from ..formatting import human_readable_size
 
 
 def do_get(app, *args):
@@ -107,3 +115,320 @@ def do_put(app, *args):
 
     except Exception as e:
         print(f"Error during put: {e}")
+
+
+# ---------------------------------------------------------------------------
+# mirror — recursive download preserving directory structure
+# ---------------------------------------------------------------------------
+
+_SIZE_UNITS = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3, 'TB': 1024**4}
+
+
+def _parse_size(size_str):
+    """Parse a human-readable size string like '100MB' into bytes."""
+    m = re.match(r'^(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB)$', size_str.upper().strip())
+    if not m:
+        return None
+    return int(float(m.group(1)) * _SIZE_UNITS[m.group(2)])
+
+
+def _recursive_walk(app, prefix, max_depth, current_depth=0):
+    """Recursively list all files under prefix up to max_depth.
+    Yields (full_key, file_info) tuples.
+    """
+    dirs, files, _ = app.list_objects(prefix)
+
+    for f in files:
+        full_key = prefix + f['name']
+        yield full_key, f
+
+    if max_depth is not None and current_depth >= max_depth:
+        return
+
+    for d in dirs:
+        sub_prefix = prefix + d + '/'
+        yield from _recursive_walk(app, sub_prefix, max_depth, current_depth + 1)
+
+
+def do_mirror(app, *args):
+    """Recursively download a remote prefix preserving directory structure.
+
+    Usage: mirror <remote_prefix/> [local_dir] [options]
+    Options:
+      --depth N        Max recursion depth (default: unlimited)
+      --max-size SIZE  Skip files larger than SIZE (default: 100MB)
+      --dry-run        Show what would be downloaded without downloading
+      --include PAT    Only include files matching glob pattern
+      --exclude PAT    Exclude files matching glob pattern
+      --flat           Download all files into a single directory
+    """
+    arg_list = list(args)
+    remote_prefix = ''
+    local_dir = None
+    depth = None
+    max_size = 100 * 1024 * 1024  # 100MB default
+    dry_run = False
+    include_pat = None
+    exclude_pat = None
+    flat = False
+
+    i = 0
+    positional = []
+    while i < len(arg_list):
+        arg = arg_list[i]
+        if arg == '--depth' and i + 1 < len(arg_list):
+            try:
+                depth = int(arg_list[i + 1])
+            except ValueError:
+                print("Invalid depth: " + arg_list[i + 1])
+                return
+            i += 2
+        elif arg == '--max-size' and i + 1 < len(arg_list):
+            parsed = _parse_size(arg_list[i + 1])
+            if parsed is None:
+                print("Invalid size: " + arg_list[i + 1] + " (e.g. 100MB, 50KB)")
+                return
+            max_size = parsed
+            i += 2
+        elif arg == '--dry-run':
+            dry_run = True
+            i += 1
+        elif arg == '--include' and i + 1 < len(arg_list):
+            include_pat = arg_list[i + 1]
+            i += 2
+        elif arg == '--exclude' and i + 1 < len(arg_list):
+            exclude_pat = arg_list[i + 1]
+            i += 2
+        elif arg == '--flat':
+            flat = True
+            i += 1
+        elif arg == '--help':
+            print("Usage: mirror <remote_prefix/> [local_dir] [--depth N] [--max-size SIZE]")
+            print("             [--dry-run] [--include PAT] [--exclude PAT] [--flat]")
+            return
+        elif not arg.startswith('-'):
+            positional.append(arg)
+            i += 1
+        else:
+            print("Unknown option: " + arg)
+            return
+
+    if not positional:
+        print("Usage: mirror <remote_prefix/> [local_dir] [options]")
+        return
+
+    remote_prefix = positional[0]
+    if len(positional) > 1:
+        local_dir = positional[1]
+
+    # Resolve remote prefix
+    if remote_prefix == '.':
+        prefix = app.current_prefix
+    else:
+        prefix = app.provider.resolve_path(app.current_prefix, remote_prefix, is_directory=True)
+
+    # Default local dir
+    if local_dir is None:
+        bucket_name = getattr(app.provider, 'bucket_name', 'bucket')
+        local_dir = os.path.join('.', 'mirror-' + bucket_name)
+        if prefix:
+            local_dir = os.path.join(local_dir, prefix.rstrip('/'))
+
+    depth_str = str(depth) if depth is not None else '∞'
+    print("🔄 Mirroring %s (depth: %s, max-size: %s)" % (
+        prefix or '/', depth_str, human_readable_size(max_size)))
+    if dry_run:
+        print("   (dry run — no files will be downloaded)")
+    print("   → %s" % os.path.abspath(local_dir))
+    print()
+
+    downloaded = 0
+    skipped_size = 0
+    skipped_filter = 0
+    total_bytes = 0
+    errors = 0
+
+    for full_key, f in _recursive_walk(app, prefix, depth):
+        basename = f['name']
+        file_size = f.get('size', 0)
+
+        # Apply include/exclude filters
+        if include_pat and not fnmatch.fnmatch(basename, include_pat):
+            skipped_filter += 1
+            continue
+        if exclude_pat and fnmatch.fnmatch(basename, exclude_pat):
+            skipped_filter += 1
+            continue
+
+        # Apply max-size filter
+        if file_size > max_size:
+            skipped_size += 1
+            continue
+
+        # Determine local path
+        rel_path = full_key[len(prefix):] if full_key.startswith(prefix) else full_key
+        if flat:
+            local_path = os.path.join(local_dir, os.path.basename(rel_path))
+        else:
+            local_path = os.path.join(local_dir, rel_path.replace('/', os.sep))
+
+        size_str = human_readable_size(file_size)
+
+        if dry_run:
+            print("   %-55s %9s" % (full_key, size_str))
+            downloaded += 1
+            total_bytes += file_size
+            continue
+
+        # Create directory structure
+        local_parent = os.path.dirname(local_path)
+        if local_parent:
+            os.makedirs(local_parent, exist_ok=True)
+
+        try:
+            app.provider.download_file(full_key, local_path)
+            print("   %-55s %9s  ✅" % (full_key, size_str))
+            downloaded += 1
+            total_bytes += file_size
+        except Exception as e:
+            print("   %-55s %9s  ❌ %s" % (full_key, size_str, e))
+            errors += 1
+
+    # Summary
+    print()
+    action = "Would download" if dry_run else "Downloaded"
+    print("📦 %s: %d files (%s)" % (action, downloaded, human_readable_size(total_bytes)))
+    if skipped_size:
+        print("   Skipped (too large): %d" % skipped_size)
+    if skipped_filter:
+        print("   Skipped (filtered):  %d" % skipped_filter)
+    if errors:
+        print("   Errors: %d" % errors)
+    if not dry_run:
+        print("   Saved to: %s" % os.path.abspath(local_dir))
+    print()
+
+
+# ---------------------------------------------------------------------------
+# diff — compare two files (local or remote)
+# ---------------------------------------------------------------------------
+
+def _is_local_path(path):
+    """Check if a path refers to a local file."""
+    return path.startswith('./') or path.startswith('~/') or path.startswith('/')
+
+
+def _resolve_file(app, path, temp_dir):
+    """Resolve a file path to a local file. Downloads remote files to temp_dir.
+    Returns (local_path, display_name).
+    """
+    if _is_local_path(path):
+        expanded = os.path.expanduser(path)
+        if not os.path.isfile(expanded):
+            raise FileNotFoundError("Local file not found: %s" % expanded)
+        return expanded, path
+    else:
+        key = app.provider.resolve_path(app.current_prefix, path, is_directory=False)
+        local_path = os.path.join(temp_dir, os.path.basename(key) + '.remote')
+        app.provider.download_file(key, local_path)
+        return local_path, key
+
+
+def _is_text_file(path):
+    """Heuristic check if a file is text."""
+    try:
+        with open(path, 'rb') as f:
+            chunk = f.read(8192)
+        chunk.decode('utf-8')
+        return True
+    except (UnicodeDecodeError, IOError):
+        return False
+
+
+def _file_sha256(path):
+    """Compute SHA-256 hash of a file."""
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def do_diff(app, *args):
+    """Compare two files (local or remote).
+
+    Usage: diff <file_a> <file_b>
+    Paths starting with ./ ~/ or / are local; others are remote.
+    """
+    if len(args) != 2:
+        print("Usage: diff <file_a> <file_b>")
+        print("  Paths starting with ./ ~/ or / are treated as local files.")
+        print("  Other paths are treated as remote bucket objects.")
+        return
+
+    temp_dir = tempfile.mkdtemp(prefix='bb-diff-')
+    try:
+        try:
+            path_a, name_a = _resolve_file(app, args[0], temp_dir)
+        except Exception as e:
+            print("❌ Error resolving %s: %s" % (args[0], e))
+            return
+
+        try:
+            path_b, name_b = _resolve_file(app, args[1], temp_dir)
+        except Exception as e:
+            print("❌ Error resolving %s: %s" % (args[1], e))
+            return
+
+        is_text_a = _is_text_file(path_a)
+        is_text_b = _is_text_file(path_b)
+
+        if is_text_a and is_text_b:
+            with open(path_a, 'r', errors='replace') as f:
+                lines_a = f.readlines()
+            with open(path_b, 'r', errors='replace') as f:
+                lines_b = f.readlines()
+
+            diff_lines = list(difflib.unified_diff(
+                lines_a, lines_b,
+                fromfile=name_a, tofile=name_b,
+            ))
+
+            if not diff_lines:
+                print("✅ Files are identical.")
+                return
+
+            print()
+            for line in diff_lines:
+                line = line.rstrip('\n')
+                if line.startswith('+++') or line.startswith('---'):
+                    print("\033[1m%s\033[0m" % line)
+                elif line.startswith('+'):
+                    print("\033[32m%s\033[0m" % line)
+                elif line.startswith('-'):
+                    print("\033[31m%s\033[0m" % line)
+                elif line.startswith('@@'):
+                    print("\033[36m%s\033[0m" % line)
+                else:
+                    print(line)
+            print()
+        else:
+            # Binary comparison
+            size_a = os.path.getsize(path_a)
+            size_b = os.path.getsize(path_b)
+            hash_a = _file_sha256(path_a)
+            hash_b = _file_sha256(path_b)
+
+            print()
+            print("Binary comparison:")
+            print("  %-40s  %9s  sha256:%s" % (name_a, human_readable_size(size_a), hash_a[:16]))
+            print("  %-40s  %9s  sha256:%s" % (name_b, human_readable_size(size_b), hash_b[:16]))
+            print()
+            if hash_a == hash_b:
+                print("✅ Files are identical.")
+            else:
+                print("❌ Files differ.")
+            print()
+
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)

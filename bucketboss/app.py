@@ -15,10 +15,11 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 from .completer import BucketBossCompleter
 from .providers.base import CloudProvider
-from .commands.navigation import do_ls, do_cd
+from .commands.navigation import do_ls, do_cd, do_tree
 from .commands.read import do_cat, do_peek, do_open
-from .commands.transfer import do_get, do_put
-from .commands.info import do_stats, do_crawl_status, do_audit, do_pwd, do_info, do_head
+from .commands.transfer import do_get, do_put, do_mirror, do_diff
+from .commands.search import do_find
+from .commands.info import do_stats, do_crawl_status, do_audit, do_pwd, do_info, do_head, do_du
 from .commands.recon import do_enum, do_enum_report, do_th, do_scope
 from .commands.findings import do_tag, do_findings, do_export
 from .commands.shell import do_exit, do_clear, do_help
@@ -67,6 +68,11 @@ class BucketBossApp:
             'tag': lambda *args: do_tag(self, *args),
             'findings': lambda *args: do_findings(self, *args),
             'export': lambda *args: do_export(self, *args),
+            'tree': lambda *args: do_tree(self, *args),
+            'mirror': lambda *args: do_mirror(self, *args),
+            'diff': lambda *args: do_diff(self, *args),
+            'find': lambda *args: do_find(self, *args),
+            'du': lambda *args: do_du(self, *args),
         }
         self.stats_result = {"status": "pending"}
         self.last_enum_results = None
